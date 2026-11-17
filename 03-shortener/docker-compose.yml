@@ -1,0 +1,42 @@
+# Mặc định chỉ chạy Postgres + Redis; app chạy bằng `go run` cho dễ debug.
+# Chạy cả app trong Docker: docker compose --profile full up --build
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: shortener
+    ports: ["5432:5432"]
+    volumes:
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d shortener"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  api:
+    profiles: ["full"]
+    build:
+      context: ..
+      dockerfile: 03-shortener/Dockerfile
+    environment:
+      DATABASE_URL: postgres://app:app@postgres:5432/shortener?sslmode=disable
+      REDIS_ADDR: redis:6379
+      GOMEMLIMIT: 450MiB
+    ports: ["8080:8080"]
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 512M }
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+
+volumes:
+  pgdata:

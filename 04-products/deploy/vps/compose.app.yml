@@ -1,0 +1,59 @@
+# Máy app (app1, app2...): Nginx nhận HTTPS từ Cloudflare, chia cho 2 instance API trên máy; API của máy kia làm dự phòng.
+# Mọi service dùng mạng của máy (network_mode: host) để firewall ufw quản được hết (cổng Docker publish thì đi vòng qua ufw).
+# API chỉ nghe trên IP WireGuard (10.10.0.x): Internet không chạm tới; Nginx máy kia vẫn gọi được.
+name: products
+
+x-api: &api
+  image: products-api:latest
+  restart: unless-stopped
+  network_mode: host
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  healthcheck:
+    test: ["CMD", "/api", "healthcheck"]
+    interval: 5s
+    timeout: 3s
+    retries: 3
+    start_period: 30s
+  stop_grace_period: 20s
+  deploy:
+    resources:
+      limits: { memory: 768M }
+
+x-env: &env
+  DATABASE_URL: postgres://app:${POSTGRES_PASSWORD:?}@${DB_IP:?}:5432/products?sslmode=disable # WireGuard đã mã hoá đường truyền
+  REDIS_ADDR: ${DB_IP}:6379
+  REDIS_PASSWORD: ${REDIS_PASSWORD:?}
+  DATABASE_READ_URL: ${DATABASE_READ_URL:-} # standby: đọc search/danh sách khi nó theo kịp primary
+  DB_MAX_CONNS: ${DB_MAX_CONNS:-20} # deploy.ps1 chia theo số máy app để tổng không vượt max_connections của Postgres
+  GOMEMLIMIT: 600MiB
+  JWT_SECRET: ${JWT_SECRET:?}
+  ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+  ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+  STORAGE_ENDPOINT: ${DB_IP}:9000
+  STORAGE_PRESIGN_ENDPOINT: https://${DOMAIN:?} # client upload qua Cloudflare → Nginx → storage
+  STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY:?}
+  STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:?}
+  STORAGE_BUCKET: media
+  STORAGE_PUBLIC_URL: https://${DOMAIN}/media
+  CORS_ORIGINS: ${CORS_ORIGINS:-}
+
+services:
+  api1:
+    <<: *api
+    environment: { <<: *env, ADDR: "${SELF_IP:?}:8081" }
+  api2:
+    <<: *api
+    environment: { <<: *env, ADDR: "${SELF_IP}:8082" }
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro # update.sh tạo từ nginx.conf.tmpl
+      - ./origin.pem:/etc/nginx/origin.pem:ro # chứng chỉ Cloudflare Origin CA (README bước 2)
+      - ./origin.key:/etc/nginx/origin.key:ro
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }

@@ -1,0 +1,83 @@
+# Mặc định chỉ chạy Postgres + Redis (app chạy bằng `go run` để debug).
+# Chạy đủ: 3 instance API sau Nginx (load balancer) ở http://localhost:8080
+#   docker compose --profile full up --build
+# Đổi số instance: docker compose --profile full up --build --scale api=5
+services:
+  postgres:
+    image: postgres:17-alpine
+    command: ["postgres", "-c", "max_connections=200", "-c", "shared_buffers=512MB", "-c", "work_mem=8MB"]
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: products
+    ports: ["5433:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data # bảng được tạo bởi migration app tự chạy lúc khởi động
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d products"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    # Chỉ làm cache: giới hạn RAM, tự đẩy key ít dùng ra, không ghi đĩa.
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru", "--save", "", "--appendonly", "no"]
+    ports: ["6380:6379"]
+
+  # Lưu file tương thích S3 (production cũng dùng SeaweedFS, xem deploy/vps). http://localhost:9000/products/<key>
+  storage:
+    image: chrislusf/seaweedfs:4.53
+    command: ["server", "-dir=/data", "-s3", "-s3.port=9000", "-s3.config=/etc/seaweedfs/s3.json"]
+    ports: ["9000:9000"]
+    volumes:
+      - ./dev/s3.json:/etc/seaweedfs/s3.json:ro # khoá truy cập dev + cho phép đọc công khai bucket "products"
+      - s3data:/data
+
+  storage-init: # tạo bucket "products" rồi thoát
+    image: amazon/aws-cli:2.27.0
+    environment: { AWS_ACCESS_KEY_ID: devaccesskey, AWS_SECRET_ACCESS_KEY: devsecretkey, AWS_DEFAULT_REGION: us-east-1 }
+    entrypoint: ["sh", "-c", "until aws --endpoint-url http://storage:9000 s3api head-bucket --bucket products 2>/dev/null || aws --endpoint-url http://storage:9000 s3api create-bucket --bucket products; do sleep 1; done"]
+    depends_on: [storage]
+
+  api:
+    profiles: ["full"]
+    build:
+      context: ..
+      dockerfile: 04-products/Dockerfile
+    environment:
+      DATABASE_URL: postgres://app:app@postgres:5432/products?sslmode=disable
+      REDIS_ADDR: redis:6379
+      DB_MAX_CONNS: "40"
+      GOMEMLIMIT: 450MiB
+      # Chỉ dùng cho dev. Production: deploy.ps1 tự sinh JWT_SECRET ngẫu nhiên.
+      JWT_SECRET: dev-only-secret-do-not-use-in-production
+      ADMIN_EMAIL: admin@example.com
+      ADMIN_PASSWORD: admin12345
+      STORAGE_ENDPOINT: storage:9000         # API nói chuyện với storage trong mạng Docker
+      STORAGE_PRESIGN_ENDPOINT: localhost:9000 # upload_url phải là địa chỉ máy bạn (trình duyệt/curl) truy cập được
+      STORAGE_ACCESS_KEY: devaccesskey
+      STORAGE_SECRET_KEY: devsecretkey
+    deploy:
+      replicas: 3
+      resources:
+        limits: { cpus: "2", memory: 512M }
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+      storage-init: { condition: service_completed_successfully }
+
+  nginx:
+    profiles: ["full"]
+    image: nginx:1.27-alpine
+    ports: ["8080:80"]
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
+    depends_on: [api]
+
+volumes:
+  pgdata:
+  s3data:

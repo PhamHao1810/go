@@ -1,0 +1,102 @@
+# Nginx trên máy app. update.sh thay các __CHỖ_TRỐNG__ bằng giá trị trong .env (deploy.ps1 tính) rồi ghi ra nginx.conf.
+# Chỉ Cloudflare vào được cổng 443 (firewall, xem cf-ufw.sh), nên IP thật của khách lấy từ header CF-Connecting-IP.
+worker_processes auto;
+worker_rlimit_nofile 65535;
+
+events {
+    worker_connections 16384;
+    multi_accept on;
+}
+
+http {
+    server_tokens off;
+    access_log /var/log/nginx/access.log combined buffer=64k flush=5s;
+    keepalive_timeout 65s;
+    keepalive_requests 10000;
+    gzip on;
+    gzip_types application/json;
+    gzip_min_length 1024;
+
+    set_real_ip_from 0.0.0.0/0; # an toàn vì firewall chỉ cho IP Cloudflare kết nối tới
+    real_ip_header CF-Connecting-IP;
+
+    upstream api {
+        zone api 64k;
+        # API của MỌI máy app chung 1 nhóm, gửi cho API đang giữ ít request nhất. Máy bận/yếu trả lời chậm → request
+        # dồn ở đó → nhận ít request mới hơn: tự san tải sang máy rảnh, không cần cấu hình theo cấu hình máy.
+        least_conn;
+        server __SELF_IP__:8081 max_fails=1 fail_timeout=5s;
+        server __SELF_IP__:8082 max_fails=1 fail_timeout=5s;
+__PEER_SERVERS__
+        keepalive 64;
+    }
+    upstream storage {
+        server __DB_IP__:9000;
+        keepalive 16;
+    }
+
+    # Mỗi máy app đếm riêng, nên deploy.ps1 chia ngưỡng cho số máy app (Cloudflare rải đều request của 1 khách
+    # qua các máy) → tổng cả cụm ≈ 50 request/giây/IP, đăng nhập/đăng ký 30/phút/IP. 1 máy chết thì ngưỡng chặt hơn.
+    # ponytail: giới hạn theo IP; khách 4G/CGNAT chung 1 IP có thể bị 429 khi rất đông — nới RATE_* nếu log có nhiều 429.
+    limit_req_zone $binary_remote_addr zone=perip:20m rate=__RATE_API__;
+    limit_req_zone $binary_remote_addr zone=auth:10m rate=__RATE_AUTH__; # đăng ký/đăng nhập tốn CPU (bcrypt)
+    limit_req_status 429;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_certificate /etc/nginx/origin.pem;
+    ssl_certificate_key /etc/nginx/origin.key;
+
+    # Ai gõ thẳng IP máy hoặc domain lạ: từ chối ngay lúc bắt tay TLS, không lộ chứng chỉ/domain.
+    server {
+        listen 443 ssl default_server;
+        ssl_reject_handshake on;
+    }
+
+    server {
+        listen 443 ssl;
+        http2 on;
+        server_name __DOMAIN__;
+        client_max_body_size 1m;
+
+        add_header X-Content-Type-Options nosniff always;
+        add_header X-Frame-Options DENY always;
+        add_header Referrer-Policy strict-origin-when-cross-origin always;
+
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $http_host; # giữ nguyên domain: upload_url được ký theo domain
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_connect_timeout 500ms; # API/storage cùng mạng nội bộ: không mở được kết nối trong 0,5s = máy đó có vấn đề
+        proxy_read_timeout 15s;
+        # Instance chết/đang cập nhật → thử instance khác. Nginx KHÔNG retry POST/PUT/DELETE đã gửi đi
+        # (không có non_idempotent), nên không bao giờ trừ kho 2 lần vì retry.
+        proxy_next_upstream error timeout http_502 http_503;
+        proxy_next_upstream_tries 3;
+
+        location / {
+            limit_req zone=perip burst=100 nodelay;
+            proxy_pass http://api;
+        }
+
+        location /api/v1/auth/ {
+            limit_req zone=auth burst=20 nodelay;
+            proxy_pass http://api;
+        }
+
+        # Ảnh: GET công khai (Cloudflare cache lại), PUT chỉ thành công khi có chữ ký hợp lệ trong upload_url.
+        location /media/ {
+            limit_req zone=perip burst=200 nodelay;
+            limit_except GET PUT { deny all; }
+            client_max_body_size 6m;
+            proxy_pass http://storage;
+            add_header Cache-Control "public, max-age=31536000, immutable"; # tên file ngẫu nhiên, không bao giờ ghi đè
+            add_header X-Content-Type-Options nosniff always;
+            add_header Content-Security-Policy "default-src 'none'; sandbox" always; # không bao giờ chạy như trang web
+        }
+        location = /media/ { return 404; } # chặn liệt kê file
+    }
+}

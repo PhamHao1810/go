@@ -1,0 +1,8 @@
+*.exe
+*.test
+*.out
+*.prof
+/bin/
+.env
+04-products/deploy/vps/origin.*
+04-products/deploy/vps/lab/
