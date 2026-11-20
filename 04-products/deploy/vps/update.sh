@@ -38,14 +38,20 @@ else
   echo "== DB ($ROLE)"
   docker compose up -d --wait --wait-timeout 3600 postgres redis storage ||
     { docker compose logs --tail 50 postgres storage; exit 1; }
-  docker compose --profile "$ROLE" up -d
+  if [ "$(val SEARCH)" = 1 ]; then
+    docker compose --profile "$ROLE" --profile search up -d
+  else
+    docker compose --profile search rm -sf meilisearch >/dev/null 2>&1 || true # máy này thôi chạy search
+    docker compose --profile "$ROLE" up -d
+  fi
 fi
 docker image prune -f >/dev/null # xoá image cũ, tránh đầy ổ sau nhiều lần deploy
 
 # Cron: kiểm tra sức khoẻ 5 phút/lần; backup 3h sáng ở standby (không có standby thì ở primary).
 [ -f .first-deploy ] || touch .first-deploy
 {
-  crontab -l 2>/dev/null | grep -v -e monitor.sh -e backup.sh
+  # || true: crontab rỗng → grep trả 1 → set -e thoát khỏi nhóm { } trước khi echo → cài crontab RỖNG (lỗi cũ: chưa máy nào có cron)
+  crontab -l 2>/dev/null | grep -v -e monitor.sh -e backup.sh || true
   echo "*/5 * * * * sh $PWD/monitor.sh"
   if [ "$ROLE" = standby ] || { [ "$ROLE" = primary ] && [ -z "$(val STANDBY_IP)" ]; }; then
     echo "0 3 * * * sh $PWD/backup.sh >> $HOME/backups/backup.log 2>&1"

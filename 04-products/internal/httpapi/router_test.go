@@ -43,7 +43,13 @@ func (s *stubService) Update(context.Context, domain.Product) (domain.Product, e
 	return s.product, s.err
 }
 func (s *stubService) Delete(context.Context, int64) error { return s.err }
-func (s *stubService) Purchase(context.Context, int64, int64) (domain.Product, error) {
+func (s *stubService) Purchase(context.Context, domain.Principal, int64, int64) (domain.Product, error) {
+	return s.product, s.err
+}
+func (s *stubService) SetTags(context.Context, int64, []string) (domain.Product, error) {
+	return s.product, s.err
+}
+func (s *stubService) SetAttributes(context.Context, int64, []domain.AttributeValue) (domain.Product, error) {
 	return s.product, s.err
 }
 func (s *stubService) AddImage(context.Context, domain.Principal, int64, int64) (domain.Product, error) {

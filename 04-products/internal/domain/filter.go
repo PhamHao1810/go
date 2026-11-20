@@ -22,13 +22,15 @@ const (
 
 // ListFilter: lọc + sắp xếp + phân trang cho danh sách sản phẩm. Cursor là chuỗi mờ (opaque) do server cấp.
 type ListFilter struct {
-	Query    string
-	MinPrice *int64
-	MaxPrice *int64
-	InStock  bool
-	Sort     Sort
-	Limit    int
-	Cursor   string
+	Query      string
+	CategoryID *int64 // gồm cả danh mục con
+	BrandID    *int64
+	MinPrice   *int64
+	MaxPrice   *int64
+	InStock    bool
+	Sort       Sort
+	Limit      int
+	Cursor     string
 }
 
 type Page struct {
@@ -61,5 +63,7 @@ func (f *ListFilter) Normalize() error {
 	}
 	v.Check(f.MinPrice == nil || *f.MinPrice >= 0, "min_price", "must be >= 0")
 	v.Check(f.MinPrice == nil || f.MaxPrice == nil || *f.MinPrice <= *f.MaxPrice, "max_price", "must be >= min_price")
+	v.Check(f.CategoryID == nil || *f.CategoryID > 0, "category_id", "must be a positive integer")
+	v.Check(f.BrandID == nil || *f.BrandID > 0, "brand_id", "must be a positive integer")
 	return v.Err()
 }

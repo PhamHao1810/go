@@ -15,7 +15,8 @@ check() { # check <tên bước> <mong đợi> <thực tế>
 }
 req() { # req <method> <path> <token|-> [body] → in body, lưu status vào $TMP/status
   auth=""; [ "$3" != "-" ] && auth="Authorization: Bearer $3"
-  curl -s -o "$TMP/body" -w "%{http_code}" -X "$1" "$B$2" -H "Content-Type: application/json" ${auth:+-H "$auth"} ${4:+-d "$4"} > "$TMP/status"
+  # Body đi qua stdin, không qua tham số dòng lệnh: Git Bash trên Windows làm hỏng chữ có dấu trong tham số.
+  printf '%s' "$4" | curl -s -o "$TMP/body" -w "%{http_code}" -X "$1" "$B$2" -H "Content-Type: application/json"     ${auth:+-H "$auth"} ${4:+--data-binary @-} > "$TMP/status"
   cat "$TMP/body"
 }
 status() { cat "$TMP/status"; }
@@ -73,6 +74,45 @@ UAID=$(echo "$UP" | field asset_id); upload "$TMP/img.png" >/dev/null
 AVATAR=$(req PUT /me/avatar "$USER" "{\"asset_id\":$UAID}" | field avatar_url)
 check "đặt avatar" 200 "$(status)"
 check "GET /me có avatar_url" "$AVATAR" "$(req GET /me "$USER" | field avatar_url)"
+
+# --- Catalog: danh mục cây, hãng, biến thể, tag, đơn hàng, đánh giá, search ---
+ROOT=$(req POST /categories "$ADMIN" "{\"name\":\"Thời trang $RUN\",\"slug\":\"tt-$RUN\"}" | field id); check "tạo danh mục gốc" 201 "$(status)"
+LEAF=$(req POST /categories "$ADMIN" "{\"parent_id\":$ROOT,\"name\":\"Áo khoác\",\"slug\":\"ak-$RUN\"}" | field id); check "tạo danh mục con" 201 "$(status)"
+req POST /categories "$USER" "{\"name\":\"x\",\"slug\":\"x-$RUN\"}" >/dev/null; check "khách không tạo được danh mục" 403 "$(status)"
+BRAND=$(req POST /brands "$ADMIN" "{\"name\":\"Hãng $RUN\",\"slug\":\"h-$RUN\"}" | field id); check "tạo hãng" 201 "$(status)"
+PID2=$(req POST /products "$ADMIN" "{\"sku\":\"CAT-$RUN\",\"name\":\"Áo khoác gió $RUN\",\"price\":300000,\"stock\":5,\"category_id\":$LEAF,\"brand_id\":$BRAND}" | field id)
+check "tạo sản phẩm có danh mục + hãng" 201 "$(status)"
+VID=$(req POST "/products/$PID2/variants" "$ADMIN" "{\"sku\":\"CAT-$RUN-RED-L\",\"color\":\"Đỏ\",\"size\":\"L\",\"price\":280000,\"stock\":3}" | field id)
+check "thêm biến thể" 201 "$(status)"
+check "giá sản phẩm = giá thấp nhất các biến thể" 280000 "$(req GET "/products/$PID2" - | field price)"
+check "kho sản phẩm = tổng kho các biến thể" 8 "$(req GET "/products/$PID2" - | field stock)"
+req PUT "/products/$PID2/tags" "$ADMIN" '{"tags":["Hot","khuyến mãi","hot"]}' >/dev/null; check "gắn tag" 200 "$(status)"
+req PUT "/products/$PID2/attributes" "$ADMIN" '{"attributes":[{"name":"Chất liệu","value":"Polyester"}]}' >/dev/null; check "gắn thuộc tính" 200 "$(status)"
+req POST "/products/$PID2/purchase" "$USER" '{"quantity":1}' >/dev/null; check "mua nhanh sản phẩm nhiều biến thể → 400" 400 "$(status)"
+
+OID=$(req POST /orders "$USER" "{\"items\":[{\"variant_id\":$VID,\"quantity\":2}]}" | field id); check "đặt hàng" 201 "$(status)"
+check "tổng tiền chốt theo giá biến thể" 560000 "$(req GET "/orders/$OID" "$USER" | field total)"
+req POST /orders "$USER" "{\"items\":[{\"variant_id\":$VID,\"quantity\":5}]}" >/dev/null; check "đặt quá tồn kho → 409" 409 "$(status)"
+req POST "/products/$PID2/reviews" "$USER" '{"rating":5,"content":"Đẹp"}' >/dev/null; check "chưa nhận hàng không đánh giá được" 403 "$(status)"
+req PUT "/orders/$OID/status" "$USER" '{"status":"paid"}' >/dev/null; check "khách không đổi trạng thái đơn được" 403 "$(status)"
+req PUT "/orders/$OID/status" "$ADMIN" '{"status":"shipped"}' >/dev/null; check "không nhảy cóc pending → shipped" 409 "$(status)"
+for st in paid shipped delivered; do req PUT "/orders/$OID/status" "$ADMIN" "{\"status\":\"$st\"}" >/dev/null; check "đơn → $st" 200 "$(status)"; done
+req POST "/products/$PID2/reviews" "$USER" '{"rating":4,"content":"Áo đẹp, giao nhanh"}' >/dev/null; check "đánh giá sau khi nhận hàng" 201 "$(status)"
+req POST "/products/$PID2/reviews" "$USER" '{"rating":1}' >/dev/null; check "đánh giá 2 lần → 409" 409 "$(status)"
+check "điểm đánh giá trung bình" 4 "$(req GET "/products/$PID2" - | field average)"
+
+OID2=$(req POST /orders "$USER" "{\"items\":[{\"variant_id\":$VID,\"quantity\":1}]}" | field id)
+req POST "/orders/$OID2/cancel" "$USER" >/dev/null; check "huỷ đơn" 200 "$(status)"
+check "huỷ đơn trả lại kho" 6 "$(req GET "/products/$PID2" - | field stock)"
+check "lọc theo danh mục cha ra sản phẩm ở danh mục con" "$PID2" "$(req GET "/products?category_id=$ROOT" - | field id)"
+
+# Search: outbox → Meilisearch trễ ~1-2 giây. Gõ không dấu + sai chính tả vẫn phải ra.
+found=""
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  if req GET "/search?q=ao+khoac+gioo+$RUN" - | grep -q "\"id\":$PID2,"; then found=yes; break; fi
+  sleep 1
+done
+check "search không dấu + sai chính tả thấy sản phẩm mới (engine: $(req GET "/search?q=x" - | field engine))" yes "$found"
 
 # --- Mua hàng + refresh token ---
 req POST "/products/$PID/purchase" "$USER" '{"quantity":2}' >/dev/null; check "khách mua hàng" 200 "$(status)"

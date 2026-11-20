@@ -74,7 +74,10 @@ __PEER_SERVERS__
         proxy_read_timeout 15s;
         # Instance chết/đang cập nhật → thử instance khác. Nginx KHÔNG retry POST/PUT/DELETE đã gửi đi
         # (không có non_idempotent), nên không bao giờ trừ kho 2 lần vì retry.
-        proxy_next_upstream error timeout http_502 http_503;
+        # KHÔNG có http_503: 503 là API báo "quá tải/phụ thuộc lỗi" chứ không phải instance chết. Từng gặp (load test
+        # catalog): search quá tải trả 503 → max_fails=1 đánh dấu cả 4 API chết → "no live upstreams", 79% request lỗi
+        # kể cả trang không liên quan tới search. Retry 503 sang instance khác cũng chỉ nhân đôi tải lúc đang quá tải.
+        proxy_next_upstream error timeout http_502;
         proxy_next_upstream_tries 3;
 
         location / {

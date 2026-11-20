@@ -26,6 +26,10 @@ type Config struct {
 	LogLevel        slog.Level
 	CORSOrigins     []string // rỗng = tắt CORS; "*" = mọi origin
 
+	MeiliURL      string        // rỗng = không dùng Meilisearch, search chạy bằng Postgres
+	MeiliKey      string        // master key (hoặc API key có quyền search + ghi documents)
+	SearchTimeout time.Duration // Meilisearch trả lời chậm hơn → dùng Postgres
+
 	JWTSecret       []byte // BẮT BUỘC, >= 32 byte; đổi giá trị = mọi access token cũ mất hiệu lực
 	AccessTokenTTL  time.Duration
 	RefreshTokenTTL time.Duration
@@ -61,6 +65,9 @@ func Load() (Config, error) {
 		CacheTTL:        p.dur("CACHE_TTL", 30*time.Second),
 		RequestTimeout:  p.dur("REQUEST_TIMEOUT", 5*time.Second),
 		ShutdownDelay:   p.dur("SHUTDOWN_DELAY", 0),
+		MeiliURL:        p.str("MEILI_URL", ""),
+		MeiliKey:        p.str("MEILI_KEY", ""),
+		SearchTimeout:   p.dur("SEARCH_TIMEOUT", 800*time.Millisecond), // đủ cho lần đọc nguội từ đĩa ngay sau reindex
 
 		JWTSecret:       []byte(p.str("JWT_SECRET", "")),
 		AccessTokenTTL:  p.dur("ACCESS_TOKEN_TTL", 15*time.Minute),

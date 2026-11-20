@@ -62,6 +62,7 @@ var statusOf = map[domain.Kind]int{
 	domain.KindUnauthenticated: http.StatusUnauthorized,
 	domain.KindForbidden:       http.StatusForbidden,
 	domain.KindTooManyRequests: http.StatusTooManyRequests,
+	domain.KindUnavailable:     http.StatusServiceUnavailable,
 }
 
 // Error map lỗi → HTTP status + mã lỗi. Lỗi nghiệp vụ trả nguyên message; lỗi không lường trước chỉ trả

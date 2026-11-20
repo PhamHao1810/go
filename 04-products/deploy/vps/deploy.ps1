@@ -44,7 +44,7 @@ if (Test-Path $envFile) {
     foreach ($line in Get-Content $envFile) { if ($line -match '^([A-Z_0-9]+)=(.*)$') { $cfg[$Matches[1]] = $Matches[2] } }
 }
 $generated = $false
-foreach ($k in "POSTGRES_PASSWORD", "REDIS_PASSWORD", "JWT_SECRET", "STORAGE_ACCESS_KEY", "STORAGE_SECRET_KEY") {
+foreach ($k in "POSTGRES_PASSWORD", "REDIS_PASSWORD", "JWT_SECRET", "STORAGE_ACCESS_KEY", "STORAGE_SECRET_KEY", "MEILI_MASTER_KEY") {
     if (-not $cfg[$k]) { $cfg[$k] = New-Secret; $generated = $true }
 }
 if ($generated) { Write-EnvFile $envFile $cfg; Write-Host "Đã tạo mật khẩu ngẫu nhiên trong $envFile (KHÔNG chia sẻ file này)" }
@@ -58,6 +58,7 @@ if (-not $cfg.DOMAIN -or $cfg.DOMAIN -match '[/:]') { $problems += "DOMAIN=<tên
 if ($apps.Count -lt 1) { $problems += "APP_SERVERS=<IP app1>,<IP app2>" }
 if ($dbs.Count -lt 1 -or $dbs.Count -gt 2) { $problems += "DB_SERVERS=<IP db1>,<IP db2> (1 hoặc 2 máy)" }
 if ($dbs -notcontains $cfg.DB_PRIMARY) { $problems += "DB_PRIMARY=<1 IP trong DB_SERVERS>" }
+if ($cfg.SEARCH_SERVER -and $dbs -notcontains $cfg.SEARCH_SERVER) { $problems += "SEARCH_SERVER=<1 IP trong DB_SERVERS> (máy chạy Meilisearch), hoặc bỏ trống để search bằng Postgres" }
 if (($all | Sort-Object -Unique).Count -ne $all.Count) { $problems += "1 IP không được nằm ở 2 chỗ trong APP_SERVERS/DB_SERVERS" }
 if ($Skip -contains $cfg.DB_PRIMARY) { $problems += "máy DB_PRIMARY ($($cfg.DB_PRIMARY)) đang bị bỏ qua. Nếu nó chết: đổi DB_PRIMARY sang máy DB còn lại (failover, README)" }
 if ($Setup -and $Skip) { $problems += "-Setup cần mọi máy đang chạy (bỏ -Skip)" }
@@ -69,6 +70,7 @@ $wg = @{}
 for ($i = 0; $i -lt $all.Count; $i++) { $wg[$all[$i]] = "10.10.0.$($i + 1)" }
 $primary = $cfg.DB_PRIMARY
 $standby = $dbs | Where-Object { $_ -ne $primary } | Select-Object -First 1
+$search = $cfg.SEARCH_SERVER # máy DB chạy Meilisearch (tuỳ chọn)
 $targets = $all | Where-Object { $Skip -notcontains $_ }
 
 # ---------- 2. Lần đầu / thêm máy: khoá bảo mật + mạng WireGuard ----------
@@ -121,14 +123,18 @@ function Get-NodeFiles([string]$h) {
             # Rate limit đếm riêng từng máy → chia cho số máy để tổng cả cụm giữ ~50/giây và 30/phút mỗi IP.
             RATE_API = "$([math]::Ceiling(3000 / $n))r/m"; RATE_AUTH = "$([math]::Max(2, [math]::Ceiling(30 / $n)))r/m"
             JWT_SECRET = $cfg.JWT_SECRET; STORAGE_ACCESS_KEY = $cfg.STORAGE_ACCESS_KEY; STORAGE_SECRET_KEY = $cfg.STORAGE_SECRET_KEY
-            ADMIN_EMAIL = $cfg.ADMIN_EMAIL; ADMIN_PASSWORD = $cfg.ADMIN_PASSWORD; CORS_ORIGINS = $cfg.CORS_ORIGINS }
+            ADMIN_EMAIL = $cfg.ADMIN_EMAIL; ADMIN_PASSWORD = $cfg.ADMIN_PASSWORD; CORS_ORIGINS = $cfg.CORS_ORIGINS
+            # Máy Meilisearch đang bị -Skip (chết) → API không dùng nó, search chạy bằng Postgres.
+            MEILI_URL = $(if ($search -and $Skip -notcontains $search) { "http://$($wg[$search]):7700" } else { "" })
+            MEILI_KEY = $cfg.MEILI_MASTER_KEY }
         $files = "compose.app.yml", "nginx.conf.tmpl", "update.sh", "monitor.sh", "$cfgDir\origin.pem", "$cfgDir\origin.key"
     } else {
         $role = if ($h -eq $primary) { "primary" } else { "standby" }
         $sb = if ($standby -and $Skip -notcontains $standby) { $wg[$standby] } else { "" }
         $vars = $common + @{ ROLE = $role; COMPOSE_FILE = "compose.db.yml"; PRIMARY_IP = $wg[$primary]; STANDBY_IP = $sb
             STORAGE_ACCESS_KEY = $cfg.STORAGE_ACCESS_KEY; STORAGE_SECRET_KEY = $cfg.STORAGE_SECRET_KEY
-            PG_SHARED_BUFFERS = $cfg.PG_SHARED_BUFFERS; PG_EFFECTIVE_CACHE_SIZE = $cfg.PG_EFFECTIVE_CACHE_SIZE }
+            PG_SHARED_BUFFERS = $cfg.PG_SHARED_BUFFERS; PG_EFFECTIVE_CACHE_SIZE = $cfg.PG_EFFECTIVE_CACHE_SIZE
+            SEARCH = $(if ($h -eq $search) { "1" } else { "" }); MEILI_MASTER_KEY = $cfg.MEILI_MASTER_KEY }
         $files = "compose.db.yml", "pg-start.sh", "pg_hba.conf", "update.sh", "monitor.sh", "backup.sh"
     }
     Write-EnvFile "$tmp\.env" $vars

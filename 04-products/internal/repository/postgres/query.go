@@ -87,6 +87,18 @@ func buildListQuery(f domain.ListFilter) (listQuery, error) {
 	if f.InStock {
 		where = append(where, "stock > 0")
 	}
+	if f.BrandID != nil {
+		where = append(where, "brand_id = "+arg(*f.BrandID))
+	}
+	// Danh mục gồm cả cây con: path = path của nó hoặc bắt đầu bằng "path/".
+	subtree := ""
+	if f.CategoryID != nil {
+		subtree = `SELECT c.id AS cat_id FROM categories c, categories root
+			WHERE root.id = ` + arg(*f.CategoryID) + ` AND (c.path = root.path OR c.path LIKE root.path || '/%')`
+		if f.Sort == domain.SortRelevance { // search trong danh mục: lọc bình thường (đã giới hạn maxRanked dòng)
+			where = append(where, `category_id IN (SELECT cat_id FROM (`+subtree+`) s)`)
+		}
+	}
 
 	var c cursor
 	if f.Cursor != "" {
@@ -131,11 +143,23 @@ func buildListQuery(f domain.ListFilter) (listQuery, error) {
 	if ks.desc {
 		dir = "DESC"
 	}
-	sql := `SELECT ` + cols + ` FROM products`
-	if len(where) > 0 {
-		sql += ` WHERE ` + strings.Join(where, " AND ")
+	order := fmt.Sprintf(` ORDER BY %s %s, id %s LIMIT %s`, ks.col, dir, dir, arg(f.Limit+1))
+	var sql string
+	if subtree == "" {
+		sql = `SELECT ` + cols + ` FROM products`
+		if len(where) > 0 {
+			sql += ` WHERE ` + strings.Join(where, " AND ")
+		}
+		sql += order
+	} else {
+		// Duyệt danh mục cha (vd 75.000 sản phẩm trong 30 danh mục con): KHÔNG lọc "category_id IN (...)" rồi sắp
+		// cả 75.000 dòng. Mỗi danh mục con lấy N dòng đầu theo index (category_id, cột sort, id) đã sắp sẵn, rồi
+		// trộn ~30 x N dòng. Đo trên 1 triệu sản phẩm: 148ms → 4ms; load test trước khi sửa: Postgres primary
+		// hết sạch CPU chỉ vì truy vấn này.
+		where = append([]string{"category_id = s.cat_id"}, where...)
+		sql = `SELECT ` + cols + ` FROM (` + subtree + `) s CROSS JOIN LATERAL (SELECT ` + cols + ` FROM products WHERE ` +
+			strings.Join(where, " AND ") + order + `) p` + order
 	}
-	sql += fmt.Sprintf(` ORDER BY %s %s, id %s LIMIT %s`, ks.col, dir, dir, arg(f.Limit+1))
 
 	next := func(last domain.Product) string {
 		v := last.CreatedAt.Format(time.RFC3339Nano)

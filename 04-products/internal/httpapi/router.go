@@ -16,6 +16,11 @@ import (
 type Deps struct {
 	Log            *slog.Logger
 	Products       ProductService
+	Catalog        CatalogService
+	Variants       VariantService
+	Orders         OrderService
+	Reviews        ReviewService
+	Search         SearchService
 	Auth           AuthService
 	Assets         AssetService
 	AssetURL       URLFunc                     // key trong storage → URL công khai
@@ -58,6 +63,11 @@ func NewRouter(d Deps) http.Handler {
 	NewAuthHandler(d.Auth, d.AssetURL).Register(mux, g)
 	NewProductHandler(d.Products, d.AssetURL).Register(mux, g)
 	NewAssetHandler(d.Assets).Register(mux, g)
+	NewCatalogHandler(d.Catalog).Register(mux, g)
+	NewVariantHandler(d.Variants).Register(mux, g)
+	NewOrderHandler(d.Orders).Register(mux, g)
+	NewReviewHandler(d.Reviews).Register(mux, g)
+	NewSearchHandler(d.Search, d.AssetURL).Register(mux, g)
 
 	// Route không tồn tại cũng trả JSON đúng format thay vì text "404 page not found" của Go.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { response.Error(w, r, errRouteNotFound) })

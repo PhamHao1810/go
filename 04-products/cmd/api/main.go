@@ -17,6 +17,7 @@ import (
 	"golearn/04-products/internal/config"
 	"golearn/04-products/internal/httpapi"
 	"golearn/04-products/internal/logger"
+	"golearn/04-products/internal/repository/meili"
 	"golearn/04-products/internal/repository/postgres"
 	"golearn/04-products/internal/repository/rediscache"
 	"golearn/04-products/internal/repository/s3store"
@@ -28,6 +29,13 @@ import (
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" { // HEALTHCHECK của Docker: image distroless không có curl
 		os.Exit(healthcheck())
+	}
+	if len(os.Args) > 1 && os.Args[1] == "reindex" { // dựng lại toàn bộ index Meilisearch: docker compose exec api1 /api reindex
+		if err := reindex(); err != nil {
+			slog.Error("reindex failed", "err", err)
+			os.Exit(1)
+		}
+		return
 	}
 	if err := run(); err != nil {
 		slog.Error("fatal", "err", err)
@@ -105,7 +113,40 @@ func run() error {
 		productRepo.ReadFrom(rr)
 		jobs = append(jobs, worker.Job{Name: "replica-check", Interval: 5 * time.Second, Run: rr.Check}) // mỗi instance tự kiểm tra
 	}
-	products := service.NewProductService(productRepo, rediscache.NewProductCache(rdb, cfg.CacheTTL), assets, log)
+	cache := rediscache.NewProductCache(rdb, cfg.CacheTTL)
+	catalog := service.NewCatalogService(postgres.NewCatalogRepo(pool), log)
+	orders := service.NewOrderService(postgres.NewOrderRepo(pool), cache, log)
+	products := service.NewProductService(productRepo, cache, assets, orders, log)
+	variants := service.NewVariantService(postgres.NewVariantRepo(pool), cache, log)
+	reviews := service.NewReviewService(postgres.NewReviewRepo(pool), cache, log)
+
+	// Search: Meilisearch nếu có cấu hình, lỗi/chậm thì SearchService tự dùng Postgres.
+	var engine service.SearchEngine
+	if cfg.MeiliURL != "" {
+		mc := meili.New(cfg.MeiliURL, cfg.MeiliKey)
+		engine = mc
+		source := postgres.NewSearchSource(pool)
+		sync := service.NewSearchSync(source, mc, catalog, log)
+		var ready atomic.Bool
+		// "Đã bán" đổi theo từng đơn: đẩy theo lịch thay vì mỗi đơn 1 task Meilisearch (migrations/006).
+		// Sắp xếp "bán chạy" trên search trễ tối đa ~10 phút; trang chi tiết luôn đúng.
+		jobs = append(jobs, worker.Job{Name: "search-sold-sync", Interval: 10 * time.Minute, Run: func(ctx context.Context) error {
+			_, err := source.FlushSold(ctx)
+			return err
+		}})
+		jobs = append(jobs, worker.Job{Name: "search-sync", Interval: time.Second, Run: func(ctx context.Context) error {
+			// Tạo index + settings trước lần đồng bộ đầu tiên: Meilisearch tự tạo index khi nhận document nhưng
+			// KHÔNG có settings (không lọc/sắp được). Meilisearch chưa lên → lỗi, giây sau thử lại.
+			if !ready.Load() {
+				if err := mc.Setup(ctx); err != nil {
+					return err
+				}
+				ready.Store(true)
+			}
+			return sync.Run(ctx)
+		}})
+	}
+	search := service.NewSearchService(engine, productRepo, cache, cfg.SearchTimeout, log)
 	authSvc, err := service.NewAuthService(
 		postgres.NewUserRepo(pool), postgres.NewRefreshTokenRepo(pool),
 		rediscache.NewLoginLimiter(rdb, 10, 15*time.Minute), // 10 lần sai / 15 phút / email
@@ -133,6 +174,11 @@ func run() error {
 		Handler: httpapi.NewRouter(httpapi.Deps{
 			Log:            log,
 			Products:       products,
+			Catalog:        catalog,
+			Variants:       variants,
+			Orders:         orders,
+			Reviews:        reviews,
+			Search:         search,
 			Auth:           authSvc,
 			Assets:         assets,
 			AssetURL:       store.URL,
@@ -171,4 +217,35 @@ func run() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return srv.Shutdown(shutdownCtx)
+}
+
+// reindex đổ toàn bộ sản phẩm từ Postgres sang Meilisearch (index phụ rồi swap, search không gián đoạn).
+func reindex() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	if cfg.MeiliURL == "" {
+		return errors.New("MEILI_URL is not set")
+	}
+	log := logger.New(cfg.LogLevel)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	pool, err := postgres.Connect(ctx, cfg.DatabaseURL, 4)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	mc := meili.New(cfg.MeiliURL, cfg.MeiliKey)
+	if err := mc.Setup(ctx); err != nil {
+		return err
+	}
+	catalog := service.NewCatalogService(postgres.NewCatalogRepo(pool), log)
+	start := time.Now()
+	if err := service.NewSearchSync(postgres.NewSearchSource(pool), mc, catalog, log).Reindex(ctx, mc); err != nil {
+		return err
+	}
+	n, err := mc.Stats(ctx)
+	log.Info("reindex done", "documents", n, "took", time.Since(start).Round(time.Second).String())
+	return err
 }

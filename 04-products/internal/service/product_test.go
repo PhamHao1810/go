@@ -74,20 +74,49 @@ func (m *memRepo) Delete(_ context.Context, id int64) error {
 	return nil
 }
 
-func (m *memRepo) Purchase(_ context.Context, id, qty int64) (domain.Product, error) {
+// DefaultVariant: bản giả coi mỗi sản phẩm có đúng 1 biến thể, id biến thể = id sản phẩm.
+func (m *memRepo) DefaultVariant(_ context.Context, id int64) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.items[id]; !ok {
+		return 0, domain.ErrProductNotFound
+	}
+	return id, nil
+}
+
+func (m *memRepo) SetTags(_ context.Context, id int64, tags []string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	p, ok := m.items[id]
 	if !ok {
-		return domain.Product{}, domain.ErrProductNotFound
+		return domain.ErrProductNotFound
 	}
-	if p.Stock < qty {
-		return domain.Product{}, domain.ErrOutOfStock
-	}
-	p.Stock -= qty
-	p.Version++
+	p.Tags = tags
 	m.items[id] = p
-	return p, nil
+	return nil
+}
+
+func (m *memRepo) SetAttributes(context.Context, int64, []domain.AttributeValue) error { return nil }
+
+// fakeOrders: đặt hàng = trừ kho trong memRepo (đúng ngữ nghĩa SQL: thiếu hàng thì không trừ gì).
+type fakeOrders struct{ repo *memRepo }
+
+func (f fakeOrders) Place(_ context.Context, _ domain.Principal, lines []domain.OrderLine) (domain.Order, error) {
+	f.repo.mu.Lock()
+	defer f.repo.mu.Unlock()
+	for _, l := range lines {
+		p, ok := f.repo.items[l.VariantID]
+		if !ok {
+			return domain.Order{}, domain.ErrVariantNotFound
+		}
+		if p.Stock < l.Qty {
+			return domain.Order{}, domain.ErrOutOfStock
+		}
+		p.Stock -= l.Qty
+		p.Version++
+		f.repo.items[l.VariantID] = p
+	}
+	return domain.Order{ID: 1}, nil
 }
 
 func (m *memRepo) AddImage(_ context.Context, productID, assetID int64) error {
@@ -158,7 +187,7 @@ var discard = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 func newTestService() (*ProductService, *memRepo) {
 	repo := newMemRepo()
-	return NewProductService(repo, &memCache{m: map[int64]domain.Product{}}, fakeClaimer{}, discard), repo
+	return NewProductService(repo, &memCache{m: map[int64]domain.Product{}}, fakeClaimer{}, fakeOrders{repo}, discard), repo
 }
 
 func TestAddImage_ClaimsAssetAndInvalidatesCache(t *testing.T) {
@@ -199,7 +228,7 @@ func TestGet_CachesAndInvalidatesOnWrite(t *testing.T) {
 		t.Fatalf("repo.Get gọi %d lần, muốn 1 (các lần sau phải lấy từ cache)", repo.gets)
 	}
 
-	if _, err := svc.Purchase(ctx, p.ID, 2); err != nil {
+	if _, err := svc.Purchase(ctx, domain.Principal{UserID: 7}, p.ID, 2); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := svc.Get(ctx, p.ID); got.Stock != 3 {
@@ -218,7 +247,7 @@ func TestValidationStopsBeforeRepository(t *testing.T) {
 	if _, err := svc.Update(ctx, domain.Product{ID: 1, SKU: "A", Name: "x"}); !errors.As(err, &de) || de.Fields[0].Field != "version" {
 		t.Errorf("Update thiếu version: err = %v", err)
 	}
-	if _, err := svc.Purchase(ctx, 1, 0); !errors.As(err, &de) || de.Fields[0].Field != "quantity" {
+	if _, err := svc.Purchase(ctx, domain.Principal{UserID: 7}, 1, 0); !errors.As(err, &de) || de.Fields[0].Field != "quantity" {
 		t.Errorf("Purchase 0: err = %v", err)
 	}
 	if _, err := svc.List(ctx, domain.ListFilter{Limit: 500}); !errors.As(err, &de) {

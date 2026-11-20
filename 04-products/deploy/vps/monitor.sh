@@ -33,13 +33,20 @@ if [ "$ROLE" = standby ]; then
   st=$(docker compose exec -T postgres psql -U app -d products -tAc "SELECT status FROM pg_stat_wal_receiver" 2>/dev/null)
   [ "$st" = streaming ] || add "Postgres standby KHÔNG nhận dữ liệu từ primary (${st:-không kết nối})"
 fi
+if [ "$(val SEARCH)" = 1 ]; then
+  curl -fsS -m 5 "http://$(val SELF_IP):7700/health" >/dev/null 2>&1 || add "Meilisearch không trả lời (search đang chạy bằng Postgres)"
+fi
+if [ "$ROLE" = primary ]; then # job đồng bộ search tắc → khách tìm không thấy hàng mới/giá mới
+  n=$(docker compose exec -T postgres psql -U app -d products -tAc "SELECT count(*) FROM search_outbox" 2>/dev/null)
+  [ "${n:-0}" -gt 50000 ] && add "search_outbox tồn $n dòng: Meilisearch đồng bộ không kịp"
+fi
 if crontab -l 2>/dev/null | grep -q backup.sh && [ -n "$(find .first-deploy -mmin +1560 2>/dev/null)" ] &&
   [ -z "$(find ~/backups -name 'db-*.dump' -mmin -1560 2>/dev/null)" ]; then
   add "backup DB quá 26 giờ chưa chạy (xem ~/backups/backup.log)"
 fi
 
 [ "$p" = "$(cat .monitor-state 2>/dev/null)" ] && exit 0
-if [ -n "$p" ]; then msg="CẢNH BÁO $(hostname) ($ROLE):$p"; else msg="$(hostname) ($ROLE): đã ổn lại"; fi
+if [ -n "$p" ]; then msg="CẢNH BÁO $(hostname) $(val SELF_IP) ($ROLE):$p"; else msg="$(hostname) $(val SELF_IP) ($ROLE): đã ổn lại"; fi
 echo "$(date '+%F %T') $msg" >> monitor.log
 token=$(val TELEGRAM_BOT_TOKEN)
 if [ -n "$token" ]; then

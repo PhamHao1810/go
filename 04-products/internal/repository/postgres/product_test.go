@@ -37,37 +37,6 @@ func newTestRepo(t *testing.T) *ProductRepo {
 
 func uniq() string { return fmt.Sprintf("T%d", time.Now().UnixNano()) }
 
-func TestPostgres_ConcurrentPurchaseNeverOversells(t *testing.T) {
-	repo := newTestRepo(t)
-	ctx := context.Background()
-	p, err := repo.Create(ctx, domain.Product{SKU: uniq(), Name: "Hàng hot", Price: 1, Stock: 50})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var ok, outOfStock atomic.Int64
-	var wg sync.WaitGroup
-	for range 200 { // 200 người tranh 50 món
-		wg.Go(func() {
-			_, err := repo.Purchase(ctx, p.ID, 1)
-			switch {
-			case err == nil:
-				ok.Add(1)
-			case errors.Is(err, domain.ErrOutOfStock):
-				outOfStock.Add(1)
-			default:
-				t.Error(err)
-			}
-		})
-	}
-	wg.Wait()
-
-	got, _ := repo.Get(ctx, p.ID)
-	if ok.Load() != 50 || outOfStock.Load() != 150 || got.Stock != 0 {
-		t.Errorf("thành công=%d hết hàng=%d stock=%d, muốn 50/150/0", ok.Load(), outOfStock.Load(), got.Stock)
-	}
-}
-
 func TestPostgres_ConcurrentUpdateOnlyOneWins(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()

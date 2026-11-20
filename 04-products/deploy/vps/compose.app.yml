@@ -38,6 +38,8 @@ x-env: &env
   STORAGE_BUCKET: media
   STORAGE_PUBLIC_URL: https://${DOMAIN}/media
   CORS_ORIGINS: ${CORS_ORIGINS:-}
+  MEILI_URL: ${MEILI_URL:-} # rỗng = search bằng Postgres
+  MEILI_KEY: ${MEILI_KEY:-}
 
 services:
   api1:

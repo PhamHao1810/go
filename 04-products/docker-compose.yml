@@ -40,6 +40,16 @@ services:
     entrypoint: ["sh", "-c", "until aws --endpoint-url http://storage:9000 s3api head-bucket --bucket products 2>/dev/null || aws --endpoint-url http://storage:9000 s3api create-bucket --bucket products; do sleep 1; done"]
     depends_on: [storage]
 
+  # Search engine (sai chính tả, không dấu, facet). Dashboard thử search: http://localhost:7700 (key: dev-meili-master-key)
+  meilisearch:
+    image: getmeili/meilisearch:v1.20.0
+    environment:
+      MEILI_MASTER_KEY: dev-meili-master-key
+      MEILI_NO_ANALYTICS: "true"
+    ports: ["7700:7700"]
+    volumes:
+      - meilidata:/meili_data
+
   api:
     profiles: ["full"]
     build:
@@ -58,6 +68,8 @@ services:
       STORAGE_PRESIGN_ENDPOINT: localhost:9000 # upload_url phải là địa chỉ máy bạn (trình duyệt/curl) truy cập được
       STORAGE_ACCESS_KEY: devaccesskey
       STORAGE_SECRET_KEY: devsecretkey
+      MEILI_URL: http://meilisearch:7700
+      MEILI_KEY: dev-meili-master-key
     deploy:
       replicas: 3
       resources:
@@ -81,3 +93,4 @@ services:
 volumes:
   pgdata:
   s3data:
+  meilidata:

@@ -17,7 +17,9 @@ type ProductService interface {
 	List(ctx context.Context, f domain.ListFilter) (domain.Page, error)
 	Update(ctx context.Context, p domain.Product) (domain.Product, error)
 	Delete(ctx context.Context, id int64) error
-	Purchase(ctx context.Context, id, qty int64) (domain.Product, error)
+	Purchase(ctx context.Context, actor domain.Principal, id, qty int64) (domain.Product, error)
+	SetTags(ctx context.Context, id int64, tags []string) (domain.Product, error)
+	SetAttributes(ctx context.Context, id int64, attrs []domain.AttributeValue) (domain.Product, error)
 	AddImage(ctx context.Context, actor domain.Principal, productID, assetID int64) (domain.Product, error)
 	RemoveImage(ctx context.Context, productID, assetID int64) (domain.Product, error)
 }
@@ -42,6 +44,42 @@ func (h *ProductHandler) Register(mux *http.ServeMux, g Guards) {
 	handle(mux, "DELETE /api/v1/products/{id}", h.delete, g.Admin)
 	handle(mux, "POST /api/v1/products/{id}/images", h.addImage, g.Admin)
 	handle(mux, "DELETE /api/v1/products/{id}/images/{asset_id}", h.removeImage, g.Admin)
+	handle(mux, "PUT /api/v1/products/{id}/tags", h.setTags, g.Admin)
+	handle(mux, "PUT /api/v1/products/{id}/attributes", h.setAttributes, g.Admin)
+}
+
+func (h *ProductHandler) setTags(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		response.Error(w, r, err)
+		return
+	}
+	var req tagsRequest
+	if err := decode(w, r, &req); err != nil {
+		response.Error(w, r, err)
+		return
+	}
+	p, err := h.svc.SetTags(r.Context(), id, req.Tags)
+	h.product(w, r, p, err)
+}
+
+func (h *ProductHandler) setAttributes(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		response.Error(w, r, err)
+		return
+	}
+	var req attributesRequest
+	if err := decode(w, r, &req); err != nil {
+		response.Error(w, r, err)
+		return
+	}
+	attrs := make([]domain.AttributeValue, len(req.Attributes))
+	for i, a := range req.Attributes {
+		attrs[i] = domain.AttributeValue{Name: a.Name, Value: a.Value}
+	}
+	p, err := h.svc.SetAttributes(r.Context(), id, attrs)
+	h.product(w, r, p, err)
 }
 
 func (h *ProductHandler) create(w http.ResponseWriter, r *http.Request) {
@@ -69,7 +107,7 @@ func (h *ProductHandler) get(w http.ResponseWriter, r *http.Request) {
 	h.product(w, r, p, err)
 }
 
-// GET /api/v1/products?q=&min_price=&max_price=&in_stock=&sort=&limit=&cursor=
+// GET /api/v1/products?q=&category_id=&brand_id=&min_price=&max_price=&in_stock=&sort=&limit=&cursor=
 func (h *ProductHandler) list(w http.ResponseWriter, r *http.Request) {
 	f, err := parseListFilter(r.URL.Query())
 	if err != nil {
@@ -136,7 +174,7 @@ func (h *ProductHandler) purchase(w http.ResponseWriter, r *http.Request) {
 		response.Error(w, r, err)
 		return
 	}
-	p, err := h.svc.Purchase(r.Context(), id, req.Quantity)
+	p, err := h.svc.Purchase(r.Context(), actor(r), id, req.Quantity)
 	h.product(w, r, p, err)
 }
 
@@ -182,11 +220,13 @@ func (h *ProductHandler) product(w http.ResponseWriter, r *http.Request, p domai
 func parseListFilter(q url.Values) (domain.ListFilter, error) {
 	var v domain.Validator
 	f := domain.ListFilter{
-		Query:    q.Get("q"),
-		Sort:     domain.Sort(q.Get("sort")),
-		Cursor:   q.Get("cursor"),
-		MinPrice: optionalInt(q, "min_price", &v),
-		MaxPrice: optionalInt(q, "max_price", &v),
+		Query:      q.Get("q"),
+		Sort:       domain.Sort(q.Get("sort")),
+		Cursor:     q.Get("cursor"),
+		MinPrice:   optionalInt(q, "min_price", &v),
+		MaxPrice:   optionalInt(q, "max_price", &v),
+		CategoryID: optionalInt(q, "category_id", &v),
+		BrandID:    optionalInt(q, "brand_id", &v),
 	}
 	if n := optionalInt(q, "limit", &v); n != nil {
 		f.Limit = int(*n)

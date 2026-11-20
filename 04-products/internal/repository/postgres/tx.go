@@ -49,6 +49,15 @@ func db(ctx context.Context, pool *pgxpool.Pool) querier {
 	return pool
 }
 
+// inTx chạy fn trong transaction đang mở (nếu service đã mở bằng TxManager) hoặc mở transaction mới.
+// Dùng cho repository cần nhiều câu lệnh phải cùng thành công/thất bại.
+func inTx(ctx context.Context, pool *pgxpool.Pool, fn func(q querier) error) error {
+	if tx, ok := ctx.Value(txKey{}).(pgx.Tx); ok {
+		return fn(tx)
+	}
+	return pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error { return fn(tx) })
+}
+
 // queryOne/queryAll map cột → field theo TÊN (created_at → CreatedAt), field thừa (vd Images) được bỏ qua.
 func queryOne[T any](ctx context.Context, q querier, sql string, args ...any) (T, error) {
 	rows, _ := q.Query(ctx, sql, args...) // lỗi của Query được trả lại qua CollectExactlyOneRow
@@ -74,7 +83,17 @@ func pgCode(err error) string {
 	return ""
 }
 
+// pgConstraint: tên ràng buộc bị vi phạm (vd "products_category_id_fkey") để biết lỗi FK thuộc cột nào.
+func pgConstraint(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.ConstraintName
+	}
+	return ""
+}
+
 const (
+	checkViolation      = "23514"
 	uniqueViolation     = "23505"
 	foreignKeyViolation = "23503"
 )

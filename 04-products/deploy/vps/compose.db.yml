@@ -71,6 +71,29 @@ services:
     entrypoint: ["weed", "filer.sync", "-a", "${PRIMARY_IP}:8888", "-b", "${SELF_IP}:8888", "-isActivePassive"]
     depends_on: [storage]
 
+  meilisearch: # search engine, chỉ chạy trên máy SEARCH_SERVER (deploy.ps1 bật profile "search")
+    profiles: [search]
+    image: getmeili/meilisearch:v1.20.0
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      MEILI_ENV: production # bắt buộc có master key, tắt giao diện web
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-}
+      MEILI_HTTP_ADDR: ${SELF_IP}:7700 # chỉ nghe trên WireGuard
+      MEILI_NO_ANALYTICS: "true"
+      # Máy này còn chạy Postgres: index bằng 1 luồng, tối đa 1GiB RAM, để chừa CPU/RAM cho DB.
+      MEILI_MAX_INDEXING_THREADS: "1"
+      MEILI_MAX_INDEXING_MEMORY: 1GiB
+    volumes:
+      - meilidata:/meili_data
+    ulimits: # load test 1.000 khách: hết file descriptor mặc định (1024) → lỗi 500 "No file descriptors available"
+      nofile: { soft: 65535, hard: 65535 }
+    deploy:
+      resources:
+        limits: { memory: 2G }
+    stop_grace_period: 30s
+
 volumes:
   pgdata:
   s3data:
+  meilidata:

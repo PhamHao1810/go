@@ -5,7 +5,7 @@ Khách ─► Cloudflare (gói Free: chống DDoS, ẩn IP máy chủ, cache ả
            ├─► app1: Nginx :443 ─► api1, api2 ─┐        (443 chỉ nhận IP Cloudflare)
            └─► app2: Nginx :443 ─► api1, api2 ─┤  mạng riêng WireGuard 10.10.0.0/24 (mã hoá)
                                                ├─► db1 primary: Postgres + Redis + kho ảnh
-                                               └─► db2 standby: bản sao chạy liên tục + backup hằng đêm
+                                               └─► db2 standby: bản sao chạy liên tục + backup hằng đêm + Meilisearch
 ```
 
 | Rủi ro | Xử lý |
@@ -16,7 +16,8 @@ Khách ─► Cloudflare (gói Free: chống DDoS, ẩn IP máy chủ, cache ả
 | DB chết | db2 luôn có bản sao (chậm sau < 1 giây). Chuyển sang db2: ~1-2 phút, 1 lệnh (mục Failover) |
 | DDoS | Cloudflare hấp thụ. IP thật của máy không lộ; cổng 443 chỉ nhận IP Cloudflare, gõ thẳng IP bị từ chối |
 | Spam / dò mật khẩu | Rate limit theo IP thật của khách (Nginx) + khoá email sau 10 lần sai (API) + luật của Cloudflare |
-| Backup nằm cùng máy DB | Backup chạy trên db2 (khác máy), giữ 14 ngày, ảnh không bao giờ bị xoá khỏi backup |
+| Backup nằm cùng máy DB | Backup chạy trên db2 (khác máy), giữ 7 bản DB gần nhất, ảnh không bao giờ bị xoá khỏi backup |
+| Search engine chết | Meilisearch lỗi hoặc cả máy search chết (không mở được kết nối trong 0,3 giây): `/search` tự chuyển sang Postgres full-text (bỏ qua Meilisearch 5 giây rồi thử lại): vẫn tìm/mua được, chỉ mất facet, trang 2+, gõ không dấu/sai chính tả. Meilisearch chỉ *bận* (trả lời chậm) thì báo 503 thay vì đẩy tải sang Postgres. Telegram báo |
 | Không ai biết khi có sự cố | Mỗi máy tự kiểm tra 5 phút/lần, báo Telegram: máy khác mất kết nối, máy quá tải CPU/RAM, container lỗi, ổ > 80%, standby ngừng nhân bản, backup không chạy, cần reboot |
 | Bản vá kernel cần reboot | Máy app tự reboot lúc 3h (app1) / 4h (app2) — không cùng lúc. Máy DB: báo Telegram để reboot tay |
 | Cập nhật code làm gián đoạn | Thay từng instance, từng máy. Đã đo: 0 lỗi / 15.000 request khi cập nhật dưới tải 200 request/giây |
@@ -118,6 +119,31 @@ Nếu PowerShell báo không được chạy script: `Set-ExecutionPolicy -Scope
 **Migration DB** chạy lúc instance mới khởi động, khi instance cũ vẫn phục vụ, nên phải tương thích ngược:
 thêm cột/bảng thoải mái; đổi tên/xoá cột thì tách 2 lần deploy.
 
+## Search: Meilisearch (tuỳ chọn)
+
+Thêm vào `.env`: `SEARCH_SERVER=<IP 1 máy trong DB_SERVERS>` (vd db2), rồi `deploy.ps1`. Máy đó chạy Meilisearch (chỉ nghe
+trên WireGuard, master key tự sinh `MEILI_MASTER_KEY`), API của mọi máy app trỏ tới nó. Bỏ trống = search bằng Postgres.
+
+- Đồng bộ: trigger ghi `search_outbox` cùng transaction với thay đổi (sản phẩm, biến thể, tag, thuộc tính, ảnh, đổi tên
+  hãng/danh mục) → job `search-sync` đẩy lên Meilisearch, trễ ~1-2 giây. Meilisearch chết thì outbox giữ lại, lên lại thì tự bù.
+- Dựng lại toàn bộ index (sau khi seed dữ liệu lớn, đổi máy search, index hỏng) — search không gián đoạn (index phụ rồi swap):
+  `ssh deploy@<IP app1> "cd app && docker compose exec -T api1 /api reindex"`
+- Máy search chết hẳn: đổi `SEARCH_SERVER` sang máy DB kia (hoặc bỏ trống) → `deploy.ps1` → `reindex` như trên.
+
+## Seed dữ liệu lớn (load test)
+
+`scripts/seed-catalog.sql` sinh N sản phẩm (mặc định 1 triệu) kèm danh mục 3 cấp, 500 hãng, biến thể, tag, thuộc tính,
+20.000 khách, đánh giá, đơn hàng. Chạy trên db1 (~30-60 phút với VPS 2 CPU), rồi reindex:
+
+```powershell
+scp 04-products\scripts\seed-catalog.sql deploy@<IP db1>:
+ssh deploy@<IP db1> "cd app && docker compose exec -T postgres psql -U app -d products -v n=1000000 < ~/seed-catalog.sql"
+ssh deploy@<IP app1> "cd app && docker compose exec -T api1 /api reindex"
+```
+
+Chạy lại sau khi bị ngắt giữa chừng: tự làm tiếp từ sản phẩm cuối cùng. Xoá hết: `scripts/unseed-catalog.sql` (cùng cách
+chạy), rồi reindex. Load test kiểu khách thật trên dữ liệu này: `loadtest/k6-catalog.js` (đầu file có hướng dẫn).
+
 ## Failover: máy DB primary chết
 
 Telegram báo "mất kết nối WireGuard tới 10.10.0.3" và web trả lỗi 500. Kiểm tra máy đó chết thật (trang quản lý VPS),
@@ -141,36 +167,58 @@ docker compose logs -f --tail 100 api1 api2              # log API (máy app)
 docker compose logs nginx | grep ' 429 '                 # ai bị rate limit (máy app)
 docker compose exec postgres psql -U app products        # vào DB (máy DB)
 cat monitor.log                                          # lịch sử cảnh báo
+crontab -l                                               # phải có monitor.sh (mọi máy) + backup.sh (standby)
 sudo wg show                                             # kết nối giữa các máy
 ```
+
+Xem CPU/steal/RAM/mạng/từng container của mọi máy gần như real time (~3 giây/lần), từ thư mục gốc repo:
+`bash 04-products/deploy/vps/watch.sh` (Git Bash hoặc PowerShell; key đã `ssh-add`). `steal` cao = nhà cung cấp lấy bớt CPU.
 
 Reboot máy DB (khi Telegram báo cần): reboot **standby** bất cứ lúc nào; **primary** thì chọn giờ vắng
 (web lỗi ~1 phút) hoặc failover sang standby trước.
 
 ## Backup
 
-db2 mỗi đêm 3h: dump DB (giữ 14 bản) + chép ảnh mới vào `~/backups`. Tất cả máy cùng 1 nhà cung cấp: nhà cung cấp
-gặp sự cố lớn/khoá tài khoản là mất hết → **mỗi tuần tải backup về máy bạn**:
+db2 mỗi đêm 3h: dump DB (giữ 7 bản) + chép ảnh mới vào `~/backups`. Tất cả máy cùng 1 nhà cung cấp: nhà cung cấp
+gặp sự cố lớn/khoá tài khoản là mất hết → **mỗi tuần tải backup về máy bạn** (bản DB mới nhất + ảnh, giữ 8 bản):
 
 ```powershell
-scp -i $HOME\.ssh\vps -r "deploy@<IP db2>:backups" .\backup-vps
+.\04-products\deploy\vps\pull-backups.ps1            # tải ngay về $HOME\backup-vps (xem pull.log)
+.\04-products\deploy\vps\pull-backups.ps1 -Schedule  # 1 lần: Task Scheduler tự tải Chủ nhật 10:00 (máy tắt thì tải khi bật lại)
 ```
 
 Khôi phục DB (trên máy primary, trong `~/app`):
-`docker compose exec -T postgres pg_restore -U app -d products --clean < db-<ngày>.dump`. Đã thử: khôi phục đủ dữ liệu.
+`docker compose exec -T postgres pg_restore -U app -d products --clean < db-<ngày>.dump`. Đã thử trên VPS thật (2026-11-20): bản 280MB
+(1 triệu sản phẩm) khôi phục vào Postgres tạm mất 134 giây, số dòng mọi bảng khớp primary.
 
 ## Kiểm tra sức chịu tải (nên làm 1 lần trước khi mở bán)
 
-Chạy trên db2, bắn thẳng vào API (không qua Cloudflare, vì Cloudflare có thể chặn như tấn công):
+k6 chạy trên máy bạn, bắn **thẳng vào Nginx 2 máy app** (bỏ qua Cloudflare vì nó chặn như tấn công), mỗi VU giả 1 IP
+khách qua `CF-Connecting-IP` để rate limit tính như thật. Dữ liệu: seed 1 triệu sản phẩm (mục Seed dữ liệu lớn).
 
-```powershell
-scp -i $HOME\.ssh\vps 04-products\loadtest\k6.js deploy@<IP db2>:app/
-ssh -i $HOME\.ssh\vps deploy@<IP db2> "docker run --rm --network host -v ~/app:/s grafana/k6 run -e BASE_URL=http://10.10.0.1:8081 -e ADMIN_EMAIL=... -e ADMIN_PASSWORD=... /s/k6.js"
-```
+1. Mở tạm cổng 443 cho IP nhà bạn trên **mọi máy app** (mạng nhà 2 đường internet = 2 IP: chạy `curl https://api.ipify.org`
+   vài lần để biết hết): `sudo ufw insert 1 allow proto tcp from <IP nhà> to any port 443 comment k6-temp`
+2. Mỗi máy app 1 tiến trình k6, mỗi tiến trình một nửa số VU (PowerShell, thư mục gốc repo):
+   ```powershell
+   $env:BASE_URL="https://<domain>"; $env:INSECURE="1"; $env:FAKE_IPS="1"; $env:PRODUCT_MIN="<id SD- nhỏ nhất>"; $env:PRODUCT_MAX="<lớn nhất>"
+   $env:RESOLVE="<domain>=<IP app1>"; k6 run --stage 45s:500,90s:500,10s:0 04-products\loadtest\k6-catalog.js
+   # cửa sổ khác: giống hệt, RESOLVE trỏ <IP app2>. NO_SEARCH=1 để bỏ lượt tìm kiếm (đo riêng API + Postgres).
+   ```
+3. Cửa sổ thứ 3: `watch.sh` xem máy nào lên đỉnh trước. Xong: `sudo ufw delete allow proto tcp from <IP nhà> to any port 443`.
 
-Script **tạo dữ liệu thật** (200 sản phẩm, 1 khách): chạy trước khi mở bán rồi xoá đi. Xem `http_req_duration p(95)` và
-`http_req_failed`. Trên máy dev, 3 instance API + 1 Postgres đạt ~1.550 request/giây, p95 8,4ms; 50k user thường chỉ tạo
-vài trăm request/giây lúc cao điểm. Nút thắt đầu tiên sẽ là CPU máy DB (search).
+Script **tạo dữ liệu thật** (khách `k6cat-*@test.vn`, đơn hàng trừ kho sản phẩm seed): xoá bằng `unseed-catalog.sql`.
+
+**Đã đo (2026-11-20, 1 triệu sản phẩm; app 2 vCPU/2GB, DB 2 vCPU/4GB, db1 bị steal ~24% CPU):**
+
+| Kịch bản | Ổn (p95 đạt ngưỡng) | Không lỗi nhưng chậm | Sập | Nút thắt |
+|---|---|---|---|---|
+| Có search (40% lượt) | ~1.000 VU, 400 req/s, 0,05% lỗi | — | 1.500 VU: 29% lỗi (search 503) | Meilisearch hết 2 core db2 |
+| Không search | ~1.000 VU, 440 req/s | 2.000 VU, p95 chi tiết 2,1s | 3.000 VU: 47% lỗi | Postgres hết 2 core db1 |
+
+Năng lực theo core: **Postgres primary ~300 req/s/core** (đọc chi tiết + đặt hàng), **Meilisearch ~80 lượt search/s/core**
+(1 triệu document, facet), **máy app** dùng < 50% CPU ở mọi mức (Nginx + 2 API ~ 0,5 core cho 600 req/s).
+1 VU ≈ 0,4–0,5 req/s (khách nghỉ 1–3 giây giữa 2 thao tác). Muốn gấp đôi: thêm core cho db1 trước (hoặc đọc chi tiết
+sản phẩm từ standby), rồi tách Meilisearch ra máy riêng; thêm máy app chưa giúp gì.
 
 ## Rủi ro còn lại
 

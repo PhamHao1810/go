@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -22,12 +23,18 @@ type ProductService struct {
 	repo   ProductRepository
 	cache  ProductCache
 	assets AssetClaimer
+	orders OrderPlacer
 	log    *slog.Logger
 	sf     singleflight.Group
 }
 
-func NewProductService(repo ProductRepository, cache ProductCache, assets AssetClaimer, log *slog.Logger) *ProductService {
-	return &ProductService{repo: repo, cache: cache, assets: assets, log: log}
+// OrderPlacer: mua nhanh 1 sản phẩm = đặt 1 đơn cho biến thể mặc định (xem OrderService).
+type OrderPlacer interface {
+	Place(ctx context.Context, actor domain.Principal, lines []domain.OrderLine) (domain.Order, error)
+}
+
+func NewProductService(repo ProductRepository, cache ProductCache, assets AssetClaimer, orders OrderPlacer, log *slog.Logger) *ProductService {
+	return &ProductService{repo: repo, cache: cache, assets: assets, orders: orders, log: log}
 }
 
 func (s *ProductService) Create(ctx context.Context, p domain.Product) (domain.Product, error) {
@@ -127,17 +134,64 @@ func (s *ProductService) Delete(ctx context.Context, id int64) error {
 	return err
 }
 
-func (s *ProductService) Purchase(ctx context.Context, id, qty int64) (domain.Product, error) {
+// Purchase: API mua nhanh cũ, giữ để client cũ chạy tiếp. Bên dưới là 1 đơn hàng thật cho biến thể mặc định
+// (có lịch sử mua, đánh giá được). Sản phẩm nhiều biến thể → 400, phải đặt qua /orders.
+func (s *ProductService) Purchase(ctx context.Context, actor domain.Principal, id, qty int64) (domain.Product, error) {
 	var v domain.Validator
 	v.Check(qty >= 1 && qty <= 1000, "quantity", "must be between 1 and 1000")
 	if err := v.Err(); err != nil {
 		return domain.Product{}, err
 	}
-	p, err := s.repo.Purchase(ctx, id, qty)
-	if err == nil {
-		s.invalidate(ctx, id)
+	variantID, err := s.repo.DefaultVariant(ctx, id)
+	if err != nil {
+		return domain.Product{}, err
 	}
-	return p, err
+	if _, err := s.orders.Place(ctx, actor, []domain.OrderLine{{VariantID: variantID, Qty: qty}}); err != nil {
+		return domain.Product{}, err
+	}
+	s.invalidate(ctx, id)
+	return s.repo.Get(ctx, id)
+}
+
+// SetTags: chuẩn hoá (cắt khoảng trắng, chữ thường, bỏ trùng) rồi thay toàn bộ tag của sản phẩm.
+func (s *ProductService) SetTags(ctx context.Context, id int64, tags []string) (domain.Product, error) {
+	seen := make(map[string]bool, len(tags))
+	clean := make([]string, 0, len(tags))
+	for _, t := range tags {
+		t = strings.ToLower(strings.Join(strings.Fields(t), " "))
+		if !seen[t] {
+			seen[t] = true
+			clean = append(clean, t)
+		}
+	}
+	if err := domain.ValidateTags(clean); err != nil {
+		return domain.Product{}, err
+	}
+	if err := s.repo.SetTags(ctx, id, clean); err != nil {
+		return domain.Product{}, err
+	}
+	s.invalidate(ctx, id)
+	return s.repo.Get(ctx, id)
+}
+
+func (s *ProductService) SetAttributes(ctx context.Context, id int64, attrs []domain.AttributeValue) (domain.Product, error) {
+	seen := make(map[domain.AttributeValue]bool, len(attrs))
+	clean := make([]domain.AttributeValue, 0, len(attrs))
+	for _, a := range attrs {
+		a = domain.AttributeValue{Name: strings.TrimSpace(a.Name), Value: strings.TrimSpace(a.Value)}
+		if !seen[a] {
+			seen[a] = true
+			clean = append(clean, a)
+		}
+	}
+	if err := domain.ValidateAttributes(clean); err != nil {
+		return domain.Product{}, err
+	}
+	if err := s.repo.SetAttributes(ctx, id, clean); err != nil {
+		return domain.Product{}, err
+	}
+	s.invalidate(ctx, id)
+	return s.repo.Get(ctx, id)
 }
 
 // AddImage gắn 1 file actor đã upload vào sản phẩm. Claim kiểm tra file thật sự đã lên storage, đúng loại,
@@ -165,7 +219,14 @@ func (s *ProductService) RemoveImage(ctx context.Context, productID, assetID int
 // ponytail: còn khe hở nhỏ — request đọc DB trước update rồi Set cache sau khi xoá → cache cũ tối đa CACHE_TTL.
 // Chấp nhận được vì Purchase/Update luôn kiểm tra trên DB; cần chặt hơn thì dùng delayed double-delete hoặc CDC.
 func (s *ProductService) invalidate(ctx context.Context, id int64) {
-	if err := s.cache.Delete(ctx, id); err != nil {
-		s.log.WarnContext(ctx, "cache delete failed", "err", err, "id", id)
+	invalidateProducts(ctx, s.cache, s.log, id)
+}
+
+// invalidateProducts: dùng chung cho mọi service đổi dữ liệu sản phẩm (biến thể, đơn hàng, đánh giá).
+func invalidateProducts(ctx context.Context, cache ProductCache, log *slog.Logger, ids ...int64) {
+	for _, id := range ids {
+		if err := cache.Delete(ctx, id); err != nil {
+			log.WarnContext(ctx, "cache delete failed", "err", err, "id", id)
+		}
 	}
 }

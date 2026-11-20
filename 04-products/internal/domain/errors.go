@@ -13,6 +13,7 @@ const (
 	KindUnauthenticated // chưa đăng nhập / token sai → 401
 	KindForbidden       // đã đăng nhập nhưng không đủ quyền → 403
 	KindTooManyRequests // → 429
+	KindUnavailable     // phụ thuộc bên ngoài tạm lỗi → 503
 )
 
 // Error là lỗi nghiệp vụ có mã ổn định (Code) để client xử lý bằng code, không phải bằng câu chữ.

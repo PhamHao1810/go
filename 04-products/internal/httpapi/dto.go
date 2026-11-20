@@ -16,12 +16,15 @@ type createProductRequest struct {
 	SKU         string `json:"sku"`
 	Name        string `json:"name"`
 	Description string `json:"description"`
-	Price       int64  `json:"price"`
+	Price       int64  `json:"price"` // giá/kho của biến thể mặc định
 	Stock       int64  `json:"stock"`
+	CategoryID  *int64 `json:"category_id"`
+	BrandID     *int64 `json:"brand_id"`
 }
 
 func (r createProductRequest) toDomain() domain.Product {
-	return domain.Product{SKU: r.SKU, Name: r.Name, Description: r.Description, Price: r.Price, Stock: r.Stock}
+	return domain.Product{SKU: r.SKU, Name: r.Name, Description: r.Description, Price: r.Price, Stock: r.Stock,
+		CategoryID: r.CategoryID, BrandID: r.BrandID}
 }
 
 type updateProductRequest struct {
@@ -48,12 +51,23 @@ type productResponse struct {
 	SKU         string          `json:"sku"`
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
-	Price       int64           `json:"price"`
-	Stock       int64           `json:"stock"`
+	Price       int64           `json:"price"` // giá thấp nhất trong các biến thể
+	Stock       int64           `json:"stock"` // tổng tồn kho các biến thể
 	Version     int64           `json:"version"`
+	CategoryID  *int64          `json:"category_id"`
+	BrandID     *int64          `json:"brand_id"`
+	Rating      ratingResponse  `json:"rating"`
+	SoldCount   int64           `json:"sold_count"`
 	Images      []imageResponse `json:"images"`
 	CreatedAt   time.Time       `json:"created_at"`
 	UpdatedAt   time.Time       `json:"updated_at"`
+
+	// Chỉ có ở trang chi tiết (GET /products/{id}).
+	Brand      *brandResponse    `json:"brand,omitempty"`
+	Categories []categoryRef     `json:"categories,omitempty"`
+	Variants   []variantResponse `json:"variants,omitempty"`
+	Attributes []attribute       `json:"attributes,omitempty"`
+	Tags       []string          `json:"tags,omitempty"`
 }
 
 // URLFunc biến key trong storage thành URL công khai (CDN/bucket).
@@ -64,8 +78,24 @@ func toProductResponse(p domain.Product, url URLFunc) productResponse {
 	for i, img := range p.Images {
 		images[i] = imageResponse{AssetID: img.AssetID, URL: url(img.Key), Position: img.Position}
 	}
-	return productResponse{ID: p.ID, SKU: p.SKU, Name: p.Name, Description: p.Description, Price: p.Price,
-		Stock: p.Stock, Version: p.Version, Images: images, CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt}
+	res := productResponse{ID: p.ID, SKU: p.SKU, Name: p.Name, Description: p.Description, Price: p.Price,
+		Stock: p.Stock, Version: p.Version, CategoryID: p.CategoryID, BrandID: p.BrandID,
+		Rating: ratingResponse{Average: p.Rating(), Count: p.RatingCount}, SoldCount: p.SoldCount,
+		Images: images, CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt, Tags: p.Tags}
+	if p.Brand != nil {
+		b := toBrandResponse(*p.Brand)
+		res.Brand = &b
+	}
+	for _, c := range p.Categories {
+		res.Categories = append(res.Categories, categoryRef{ID: c.ID, Name: c.Name, Slug: c.Slug})
+	}
+	for _, v := range p.Variants {
+		res.Variants = append(res.Variants, toVariantResponse(v))
+	}
+	for _, a := range p.Attributes {
+		res.Attributes = append(res.Attributes, attribute{Name: a.Name, Value: a.Value})
+	}
+	return res
 }
 
 type listMeta struct {

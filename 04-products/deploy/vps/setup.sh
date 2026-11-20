@@ -45,6 +45,8 @@ printf '{"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"5"}}\
 printf '[Unit]\nAfter=wg-quick@wg0.service\nWants=wg-quick@wg0.service\n' > /etc/systemd/system/docker.service.d/wireguard.conf
 systemctl daemon-reload
 command -v docker >/dev/null 2>&1 || curl -fsSL https://get.docker.com | sh
+# VPS có sẵn Docker của Ubuntu (docker.io) thì thiếu "docker compose" → cài thêm plugin.
+docker compose version >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -yq docker-compose-v2
 systemctl restart docker
 usermod -aG docker deploy
 
@@ -80,6 +82,7 @@ KbdInteractiveAuthentication no
 MaxAuthTries 3
 AllowUsers deploy
 EOF
+mkdir -p /run/sshd # Ubuntu 24.04 bật ssh qua socket: thư mục này chưa có khi sshd chưa chạy → sshd -t báo lỗi
 sshd -t # cấu hình sai → dừng ở đây, chưa restart, không bị khoá ngoài
 systemctl restart ssh 2>/dev/null || systemctl restart sshd
 echo "Xong setup ($ROLE)."
