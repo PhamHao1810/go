@@ -33,10 +33,13 @@ type SearchService struct {
 	log      *slog.Logger
 	sf       singleflight.Group
 	openTill atomic.Int64 // unix nano: trước thời điểm này không gọi engine
+	// pg: số lượt full-text Postgres đang chạy trên instance này (tối đa = cap). Đo thật (1 triệu sản phẩm): máy search
+	// chết lúc 500 khách, không giới hạn → full-text ăn hết CPU cả 2 máy DB, trang chi tiết/danh mục lỗi theo.
+	pg chan struct{}
 }
 
-func NewSearchService(engine SearchEngine, fallback ProductRepository, cache SearchCache, timeout time.Duration, log *slog.Logger) *SearchService {
-	return &SearchService{engine: engine, fallback: fallback, cache: cache, timeout: timeout, log: log}
+func NewSearchService(engine SearchEngine, fallback ProductRepository, cache SearchCache, timeout time.Duration, pgLimit int, log *slog.Logger) *SearchService {
+	return &SearchService{engine: engine, fallback: fallback, cache: cache, timeout: timeout, log: log, pg: make(chan struct{}, max(1, pgLimit))}
 }
 
 func (s *SearchService) Search(ctx context.Context, q domain.SearchQuery) (domain.SearchResult, error) {
@@ -105,6 +108,12 @@ func timedOut(err error) bool {
 func (s *SearchService) postgres(ctx context.Context, q domain.SearchQuery) (domain.SearchResult, error) {
 	if q.Page > 1 {
 		return domain.SearchResult{}, domain.ErrSearchUnavailable
+	}
+	select { // hết lượt → báo bận ngay: thà mất vài lượt search còn hơn kéo chậm cả trang chi tiết, đặt hàng
+	case s.pg <- struct{}{}:
+		defer func() { <-s.pg }()
+	default:
+		return domain.SearchResult{}, domain.ErrSearchBusy
 	}
 	f := domain.ListFilter{Query: q.Q, CategoryID: q.CategoryID, MinPrice: q.MinPrice, MaxPrice: q.MaxPrice,
 		InStock: q.InStock, Limit: q.Limit}

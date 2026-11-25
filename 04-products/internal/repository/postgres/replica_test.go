@@ -27,3 +27,21 @@ func TestReadRouter_NotAStandbyMeansPrimary(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Primary chết + "replica" không phải standby → vẫn đọc primary (router không bật nhầm).
+func TestReadRouter_PrimaryDownNonStandbyStaysOff(t *testing.T) {
+	repo := newTestRepo(t)
+	dead, err := ConnectLazy(context.Background(), "postgres://x:x@127.0.0.1:1/x?connect_timeout=1", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dead.Close()
+	rr := NewReadRouter(dead, repo.pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rr.ok.Store(true)
+	if err := rr.Check(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if rr.ok.Load() {
+		t.Fatal("replica không phải standby mà router vẫn cho đọc")
+	}
+}

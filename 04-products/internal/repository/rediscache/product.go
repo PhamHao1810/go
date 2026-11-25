@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
+	"log/slog"
+	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -14,13 +16,45 @@ import (
 	"golearn/04-products/internal/domain"
 )
 
-func Connect(ctx context.Context, addr, password string) (*redis.Client, error) {
-	rdb := redis.NewClient(&redis.Options{Addr: addr, Password: password})
+// Connect: addrs = "host:port[,host:port...]". Mỗi kết nối mới thử lần lượt từng địa chỉ (Redis trên db1, rồi db2):
+// máy DB đầu chết thì tự dùng Redis máy sau. Mọi chỗ dùng Redis đều fail-open (cache, đếm đăng nhập, OncePer),
+// nên Redis chết hết vẫn không làm API sập: chỉ log cảnh báo, kể cả lúc khởi động.
+// ponytail: không nhân bản giữa các Redis; lúc chuyển qua lại, cache có thể cũ tối đa CACHE_TTL (30s) và bộ đếm
+// đăng nhập sai bị chia đôi. Cần chặt hơn thì dùng Redis Sentinel (redis.NewFailoverClient).
+func Connect(ctx context.Context, addrs, password string, log *slog.Logger) *redis.Client {
+	list := strings.Split(addrs, ",")
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     list[0],
+		Password: password,
+		Dialer:   dialFirst(list, 300*time.Millisecond),
+		// Mạng nội bộ: Redis không trả lời trong 0,5s = máy đó có vấn đề. Mặc định 5s/3s làm mọi request treo
+		// theo khi máy DB chết hẳn (không trả RST).
+		DialTimeout:  time.Second,
+		ReadTimeout:  500 * time.Millisecond,
+		WriteTimeout: 500 * time.Millisecond,
+	})
 	if err := rdb.Ping(ctx).Err(); err != nil {
-		rdb.Close()
-		return nil, fmt.Errorf("redis ping: %w", err)
+		log.Warn("redis unavailable at startup, running without cache", "err", err)
 	}
-	return rdb, nil
+	return rdb
+}
+
+// dialFirst trả Dialer thử từng địa chỉ theo thứ tự, mỗi địa chỉ tối đa `each`.
+func dialFirst(addrs []string, each time.Duration) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, _ string) (net.Conn, error) {
+		var d net.Dialer
+		var err error
+		for _, a := range addrs {
+			c, ctxCancel := context.WithTimeout(ctx, each)
+			conn, e := d.DialContext(c, network, strings.TrimSpace(a))
+			ctxCancel()
+			if e == nil {
+				return conn, nil
+			}
+			err = e
+		}
+		return nil, err
+	}
 }
 
 type ProductCache struct {

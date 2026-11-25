@@ -29,6 +29,7 @@ type Config struct {
 	MeiliURL      string        // rỗng = không dùng Meilisearch, search chạy bằng Postgres
 	MeiliKey      string        // master key (hoặc API key có quyền search + ghi documents)
 	SearchTimeout time.Duration // Meilisearch trả lời chậm hơn → dùng Postgres
+	SearchPGLimit int           // số lượt search full-text Postgres chạy cùng lúc mỗi instance (khi không có/mất Meilisearch)
 
 	JWTSecret       []byte // BẮT BUỘC, >= 32 byte; đổi giá trị = mọi access token cũ mất hiệu lực
 	AccessTokenTTL  time.Duration
@@ -68,6 +69,7 @@ func Load() (Config, error) {
 		MeiliURL:        p.str("MEILI_URL", ""),
 		MeiliKey:        p.str("MEILI_KEY", ""),
 		SearchTimeout:   p.dur("SEARCH_TIMEOUT", 800*time.Millisecond), // đủ cho lần đọc nguội từ đĩa ngay sau reindex
+		SearchPGLimit:   p.int("SEARCH_PG_LIMIT", 2, 1, 100),
 
 		JWTSecret:       []byte(p.str("JWT_SECRET", "")),
 		AccessTokenTTL:  p.dur("ACCESS_TOKEN_TTL", 15*time.Minute),

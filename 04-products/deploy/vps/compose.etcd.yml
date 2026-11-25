@@ -1,0 +1,24 @@
+# etcd: nơi Patroni bầu primary Postgres. Chạy trên 3 máy (deploy.ps1 chọn, thêm file này vào COMPOSE_FILE của máy đó):
+# cần 2/3 còn sống mới bầu được → 1 máy bất kỳ chết vẫn tự failover. Chỉ nghe trên WireGuard.
+# ponytail: thay hẳn 1 máy etcd đã chết (IP mới) cần "etcdctl member remove/add" (README, mục Thay máy chết).
+name: products
+
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.17
+    restart: unless-stopped
+    network_mode: host
+    command: ["etcd", "--name=${ETCD_NAME:?}", "--data-dir=/etcd-data",
+              "--listen-peer-urls=http://${SELF_IP:?}:2380", "--initial-advertise-peer-urls=http://${SELF_IP}:2380",
+              "--listen-client-urls=http://${SELF_IP}:2379,http://127.0.0.1:2379", "--advertise-client-urls=http://${SELF_IP}:2379",
+              "--initial-cluster=${ETCD_CLUSTER:?}", "--initial-cluster-state=new", "--initial-cluster-token=products",
+              # VPS bị steal CPU: nới nhịp tim để 1 lúc chậm không gây bầu lại liên tục
+              "--heartbeat-interval=250", "--election-timeout=2500"]
+    volumes:
+      - etcddata:/etcd-data
+    deploy:
+      resources:
+        limits: { memory: 256M }
+
+volumes:
+  etcddata:

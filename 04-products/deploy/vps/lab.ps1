@@ -16,7 +16,8 @@ $lab = Join-Path $here "lab"            # .env + chứng chỉ của lab (đã .
 $tmp = Join-Path $env:TEMP "products-lab" # file lớn (image) để ngoài repo, tránh OneDrive đồng bộ
 $net = "lab-net"
 $nodes = [ordered]@{ "lab-app1" = "10.10.0.1"; "lab-app2" = "10.10.0.2"; "lab-db1" = "10.10.0.3"; "lab-db2" = "10.10.0.4" }
-$images = @{ app = "nginx:1.27-alpine"; db = "postgres:17-alpine redis:7-alpine chrislusf/seaweedfs:4.53 amazon/aws-cli:2.27.0" }
+$images = @{ app = "nginx:1.27-alpine quay.io/coreos/etcd:v3.5.17"
+    db = "products-patroni:17-4.0.4 redis:7-alpine chrislusf/seaweedfs:4.53 amazon/aws-cli:2.27.0 quay.io/coreos/etcd:v3.5.17" }
 
 function Invoke-Checked {
     $exe, $rest = $args
@@ -61,20 +62,30 @@ $running = @($nodes.Keys | Where-Object { (Get-State $_) -eq "true" })
 foreach ($n in $running) {
     for ($i = 0; $i -lt 60; $i++) { docker exec $n docker info 2>&1 | Out-Null; if (-not $LASTEXITCODE) { break }; Start-Sleep 1 }
     docker exec $n mkdir -p /root/app /root/backups
+    docker exec $n sh -c "command -v curl >/dev/null || apk add -q curl" | Out-Null # monitor.sh cần curl như trên VPS
 }
 
 # 2. Image: chép từ Docker trên máy bạn sang (không tải lại từ Internet). Image API build mới mỗi lần "up".
 Write-Host "== Build image API"
 Invoke-Checked docker build -q -f "$root\04-products\Dockerfile" -t products-api:latest $root | Out-Null
-Invoke-Checked docker save -o "$tmp\api.tar" products-api:latest
-foreach ($n in $created) {
+# Image Patroni build sẵn trên máy bạn (giống hệt compose.db.yml) để các máy lab khỏi tải pip từ Internet.
+docker image inspect products-patroni:17-4.0.4 2>&1 | Out-Null
+if ($LASTEXITCODE) {
+    Write-Host "== Build image Patroni"
+    "FROM postgres:17-alpine`nRUN apk add --no-cache python3 py3-pip py3-psycopg2 py3-yaml`nRUN pip install --no-cache-dir --break-system-packages `"patroni[etcd3]==4.0.4`"" |
+        docker build -q -t products-patroni:17-4.0.4 - | Out-Null
+    if ($LASTEXITCODE) { throw "Build image Patroni thất bại" }
+}
+foreach ($n in $running) { # chỉ nạp image máy đó còn thiếu (máy cũ cũng nhận image mới thêm vào danh sách)
     $role = if ($n -like "*app*") { "app" } else { "db" }
-    foreach ($img in $images[$role] -split " ") {
+    $missing = @($images[$role] -split " " | Where-Object { docker exec $n docker image inspect $_ 2>&1 | Out-Null; $LASTEXITCODE })
+    if (-not $missing) { continue }
+    foreach ($img in $missing) {
         docker image inspect $img 2>&1 | Out-Null
         if ($LASTEXITCODE) { Invoke-Checked docker pull -q $img | Out-Null }
     }
     Write-Host "== Nạp image vào $n"
-    cmd /c "docker save $($images[$role]) | docker exec -i $n docker load -q" # cmd: PowerShell 5.1 làm hỏng dữ liệu nhị phân qua "|"
+    cmd /c "docker save $($missing -join ' ') | docker exec -i $n docker load -q" # cmd: PowerShell 5.1 làm hỏng dữ liệu nhị phân qua "|"
     if ($LASTEXITCODE) { throw "Nạp image vào $n thất bại" }
 }
 
@@ -85,6 +96,15 @@ if (Test-Path $envFile) { foreach ($l in Get-Content $envFile) { if ($l -match '
 $defaults = [ordered]@{ DOMAIN = "shop.lab"; APP_SERVERS = "10.10.0.1,10.10.0.2"; DB_SERVERS = "10.10.0.3,10.10.0.4"; DB_PRIMARY = "10.10.0.3"
     ADMIN_EMAIL = "admin@shop.lab"; ADMIN_PASSWORD = "admin12345"; PG_SHARED_BUFFERS = "256MB"; PG_EFFECTIVE_CACHE_SIZE = "768MB" }
 foreach ($k in $defaults.Keys) { if (-not $cfg[$k]) { $cfg[$k] = $defaults[$k] } }
+# Patroni có thể đã tự failover: primary = máy DB đang trả 200 ở /primary (giống deploy.ps1 trên VPS).
+$patroni = $false
+foreach ($n in $running | Where-Object { $_ -like "*db*" }) {
+    docker exec $n wget -q -T 5 -O /dev/null "http://$($nodes[$n]):8008/primary" 2>&1 | Out-Null
+    if (-not $LASTEXITCODE) {
+        $patroni = $true
+        if ($cfg.DB_PRIMARY -ne $nodes[$n]) { Write-Host "== Patroni đã tự failover: primary hiện là $n"; $cfg.DB_PRIMARY = $nodes[$n] }
+    }
+}
 [IO.File]::WriteAllText($envFile, (($cfg.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join "`n") + "`n")
 if (-not (Test-Path "$lab\origin.pem")) {
     # Lab không có Cloudflare: chứng chỉ tự ký thay cho chứng chỉ Origin.
@@ -101,9 +121,19 @@ Remove-Item -Recurse -Force "$tmp\stage" -ErrorAction SilentlyContinue
 & "$here\deploy.ps1" -Stage "$tmp\stage" -Config $envFile -Skip $skip | Out-Null
 if (-not $?) { throw "deploy.ps1 -Stage thất bại" }
 
+# Thứ tự giống deploy.ps1: máy app (2/3 etcd) → DB. Lần đầu lên Patroni: primary trước; đã có Patroni: standby trước.
+$apiTag = @(Get-Content "$tmp\stage\*\.env" | Where-Object { $_ -like "API_TAG=*" })[0] -replace '^API_TAG=', ''
+Invoke-Checked docker tag products-api:latest "products-api:$apiTag"
+Invoke-Checked docker save -o "$tmp\api.tar" "products-api:$apiTag"
 $primary = ($cfg.DB_PRIMARY)
-$order = @($nodes.Keys | Where-Object { $nodes[$_] -eq $primary }) + @($nodes.Keys | Where-Object { $_ -like "*db*" -and $nodes[$_] -ne $primary }) +
-    @($nodes.Keys | Where-Object { $_ -like "*app*" })
+$p = @($nodes.Keys | Where-Object { $nodes[$_] -eq $primary }); $s = @($nodes.Keys | Where-Object { $_ -like "*db*" -and $nodes[$_] -ne $primary })
+$order = @($nodes.Keys | Where-Object { $_ -like "*app*" }) + $(if ($patroni) { $s + $p } else { $p + $s })
+foreach ($n in $order | Where-Object { $running -contains $_ }) { # etcd ở mọi máy bỏ phiếu lên trước (xem deploy.ps1)
+    if (Select-String -Quiet -Pattern '^ETCD_NAME=.' "$tmp\stage\$($nodes[$n])\.env") {
+        Invoke-Checked docker cp "$tmp\stage\$($nodes[$n])\." "${n}:/root/app/"
+        docker exec $n sh -c "cd /root/app && docker compose up -d etcd" 2>&1 | Out-Null
+    }
+}
 foreach ($n in $order | Where-Object { $running -contains $_ }) {
     Write-Host "== Deploy $n"
     Invoke-Checked docker cp "$tmp\stage\$($nodes[$n])\." "${n}:/root/app/"

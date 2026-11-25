@@ -10,9 +10,15 @@ import (
 
 type ReviewRepo struct {
 	pool *pgxpool.Pool
+	read *ReadRouter // primary không trả lời → List đọc standby
 }
 
 func NewReviewRepo(pool *pgxpool.Pool) *ReviewRepo { return &ReviewRepo{pool: pool} }
+
+func (r *ReviewRepo) ReadFrom(rr *ReadRouter) *ReviewRepo {
+	r.read = rr
+	return r
+}
 
 // Create: chỉ khách đã NHẬN hàng (đơn delivered có sản phẩm này) mới đánh giá được, mỗi người 1 lần.
 // Điểm tổng (rating_sum/count) cộng trong cùng transaction → không bao giờ lệch với bảng reviews.
@@ -50,7 +56,11 @@ func (r *ReviewRepo) Create(ctx context.Context, rv domain.Review) (domain.Revie
 
 // List: đánh giá của 1 sản phẩm, mới nhất trước, keyset theo id.
 func (r *ReviewRepo) List(ctx context.Context, productID, cursor int64, limit int) (domain.ReviewPage, error) {
-	items, err := queryAll[domain.Review](ctx, db(ctx, r.pool), `SELECT r.id, r.product_id, r.user_id, u.name AS user_name,
+	pool := r.pool
+	if r.read != nil && r.read.PrimaryDown() {
+		pool = r.read.replica
+	}
+	items, err := queryAll[domain.Review](ctx, db(ctx, pool), `SELECT r.id, r.product_id, r.user_id, u.name AS user_name,
 			r.rating, r.content, r.created_at
 		FROM reviews r JOIN users u ON u.id = r.user_id
 		WHERE r.product_id = $1 AND ($2::bigint = 0 OR r.id < $2) ORDER BY r.id DESC LIMIT $3`, productID, cursor, limit+1)

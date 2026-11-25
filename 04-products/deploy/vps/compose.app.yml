@@ -4,7 +4,7 @@
 name: products
 
 x-api: &api
-  image: products-api:latest
+  image: products-api:${API_TAG:-latest} # deploy.ps1 gắn tag = git commit; update.sh giữ thêm bản trước để rollback
   restart: unless-stopped
   network_mode: host
   read_only: true
@@ -22,8 +22,10 @@ x-api: &api
       limits: { memory: 768M }
 
 x-env: &env
-  DATABASE_URL: postgres://app:${POSTGRES_PASSWORD:?}@${DB_IP:?}:5432/products?sslmode=disable # WireGuard đã mã hoá đường truyền
-  REDIS_ADDR: ${DB_IP}:6379
+  # Mọi máy DB, primary lúc deploy đứng đầu; read-write = nối máy đang là primary → Patroni failover thì API tự theo.
+  # connect_timeout: máy DB chết hẳn (không trả RST) thì 2s sau thử máy kế. sslmode=disable: WireGuard đã mã hoá.
+  DATABASE_URL: postgres://app:${POSTGRES_PASSWORD:?}@${DB_HOSTS:?}/products?sslmode=disable&target_session_attrs=read-write&connect_timeout=2
+  REDIS_ADDR: ${REDIS_ADDRS:?} # Redis mọi máy DB: dùng máy đầu còn sống
   REDIS_PASSWORD: ${REDIS_PASSWORD:?}
   DATABASE_READ_URL: ${DATABASE_READ_URL:-} # standby: đọc search/danh sách khi nó theo kịp primary
   DB_MAX_CONNS: ${DB_MAX_CONNS:-20} # deploy.ps1 chia theo số máy app để tổng không vượt max_connections của Postgres

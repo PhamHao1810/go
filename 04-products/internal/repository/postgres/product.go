@@ -15,8 +15,9 @@ const cols = `id, sku, name, description, price, stock, version, category_id, br
 	sold_count, created_at, updated_at`
 
 type ProductRepo struct {
-	pool *pgxpool.Pool
-	read *ReadRouter // nil = mọi truy vấn đọc primary
+	pool    *pgxpool.Pool
+	read    *ReadRouter  // nil = mọi truy vấn đọc primary
+	standby *ProductRepo // cùng repo nhưng đọc standby: dùng cho Get khi primary không trả lời
 }
 
 func NewProductRepo(pool *pgxpool.Pool) *ProductRepo {
@@ -26,6 +27,7 @@ func NewProductRepo(pool *pgxpool.Pool) *ProductRepo {
 // ReadFrom cho List (search, danh sách) đọc từ standby khi nó theo kịp primary.
 func (r *ProductRepo) ReadFrom(rr *ReadRouter) *ProductRepo {
 	r.read = rr
+	r.standby = &ProductRepo{pool: rr.replica}
 	return r
 }
 
@@ -41,6 +43,9 @@ func (r *ProductRepo) Create(ctx context.Context, p domain.Product) (domain.Prod
 
 // Get: chi tiết đầy đủ (ảnh, hãng, danh mục, biến thể, thuộc tính, tag).
 func (r *ProductRepo) Get(ctx context.Context, id int64) (domain.Product, error) {
+	if r.standby != nil && r.read.PrimaryDown() {
+		return r.standby.Get(ctx, id)
+	}
 	p, err := r.oneWithImages(ctx, `SELECT `+cols+` FROM products WHERE id = $1`, id)
 	if err != nil {
 		return p, err

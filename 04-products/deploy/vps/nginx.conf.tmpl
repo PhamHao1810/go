@@ -10,7 +10,11 @@ events {
 
 http {
     server_tokens off;
-    access_log /var/log/nginx/access.log combined buffer=64k flush=5s;
+    # rt = tổng thời gian Nginx giữ request (gồm gửi trả khách), urt = thời gian API/kho ảnh trả lời, ua = instance nào.
+    # Đo p50/p95 thật trên production + monitor.sh đếm tỉ lệ 5xx từ log này (README, mục Vận hành).
+    log_format timed '$remote_addr [$time_local] "$request" $status $body_bytes_sent rt=$request_time '
+                     'urt=$upstream_response_time ua=$upstream_addr ray=$http_cf_ray';
+    access_log /var/log/nginx/access.log timed buffer=64k flush=5s;
     keepalive_timeout 65s;
     keepalive_requests 10000;
     gzip on;
@@ -30,8 +34,9 @@ http {
 __PEER_SERVERS__
         keepalive 64;
     }
-    upstream storage {
-        server __DB_IP__:9000;
+    upstream storage { # máy DB primary chết → đọc ảnh từ bản sao trên standby
+        server __DB_IP__:9000 max_fails=1 fail_timeout=10s;
+__STORAGE_BACKUP__
         keepalive 16;
     }
 

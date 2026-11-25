@@ -56,7 +56,21 @@ func (c *memSearchCache) SetSearch(_ context.Context, k string, r domain.SearchR
 
 func newSearch(engine SearchEngine) (*SearchService, *memRepo) {
 	repo := newMemRepo()
-	return NewSearchService(engine, repo, &memSearchCache{m: map[string]domain.SearchResult{}}, 50*time.Millisecond, discard), repo
+	return NewSearchService(engine, repo, &memSearchCache{m: map[string]domain.SearchResult{}}, 50*time.Millisecond, 2, discard), repo
+}
+
+// Full-text Postgres đã chạy đủ số lượt cho phép → báo bận, không đẩy thêm lên DB.
+func TestSearch_PostgresFallbackIsLimited(t *testing.T) {
+	svc, repo := newSearch(nil)
+	svc.pg <- struct{}{}
+	svc.pg <- struct{}{} // 2/2 lượt đang chạy
+	if _, err := svc.Search(context.Background(), domain.SearchQuery{Q: "áo"}); !errors.Is(err, domain.ErrSearchBusy) || len(repo.lists) != 0 {
+		t.Fatalf("hết lượt phải trả SEARCH_BUSY, không chạm DB: err=%v lists=%d", err, len(repo.lists))
+	}
+	<-svc.pg
+	if r, err := svc.Search(context.Background(), domain.SearchQuery{Q: "áo"}); err != nil || r.Engine != "postgres" {
+		t.Fatalf("còn lượt phải chạy Postgres: r=%+v err=%v", r, err)
+	}
 }
 
 func TestSearch_UsesEngineAndCaches(t *testing.T) {

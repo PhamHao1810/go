@@ -1,32 +1,32 @@
-# Máy DB. ROLE=primary: Postgres chính + Redis + kho ảnh. ROLE=standby: bản sao chạy liên tục của primary
-# (Postgres streaming replication + đồng bộ ảnh), sẵn sàng thay khi primary chết; nơi giữ backup hằng đêm.
+# Máy DB. Postgres: Patroni tự chọn primary (tự failover), không phụ thuộc ROLE.
+# ROLE (deploy.ps1 đặt theo primary Postgres lúc deploy) chỉ quyết định kho ảnh: primary nhận ghi, standby chép liên tục
+# từ primary; standby giữ backup hằng đêm. Redis chạy ở mọi máy DB (API dùng máy đầu còn sống, xem rediscache.Connect).
 # Mọi cổng chỉ nghe trên IP WireGuard + localhost; firewall chặn Internet.
 name: products
 
 services:
-  postgres:
-    image: postgres:17-alpine
+  postgres: # Postgres do Patroni quản lý (pg-start.sh): tự failover giữa các máy DB
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM postgres:17-alpine
+        RUN apk add --no-cache python3 py3-pip py3-psycopg2 py3-yaml
+        RUN pip install --no-cache-dir --break-system-packages "patroni[etcd3]==4.0.4"
+    image: products-patroni:17-4.0.4 # đổi Dockerfile ở trên thì đổi tag này để update.sh build lại
     restart: unless-stopped
     network_mode: host
     shm_size: 256mb
     entrypoint: ["sh", "/pg-start.sh"]
-    # RAM: mặc định cho VPS 8GB (~1/4 và 3/4 RAM). Máy nhỏ hơn đặt PG_SHARED_BUFFERS, PG_EFFECTIVE_CACHE_SIZE trong .env.
-    command: ["postgres", "-c", "listen_addresses=${SELF_IP:?},127.0.0.1", "-c", "hba_file=/etc/postgresql/pg_hba.conf",
-              "-c", "max_connections=200", "-c", "shared_buffers=${PG_SHARED_BUFFERS:-2GB}",
-              "-c", "effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-6GB}", "-c", "work_mem=8MB",
-              "-c", "max_slot_wal_keep_size=10GB", "-c", "hot_standby_feedback=on"]
     environment:
-      POSTGRES_USER: app
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
-      POSTGRES_DB: products
-      PGDATA: /var/lib/postgresql/data/pgdata # thư mục con: đổi vai trò thì cất dữ liệu cũ sang bên trong cùng volume
-      ROLE: ${ROLE:?}
-      SELF_IP: ${SELF_IP}
-      PRIMARY_IP: ${PRIMARY_IP:?}
+      SELF_IP: ${SELF_IP:?}
+      ETCD_HOSTS: ${ETCD_HOSTS:?}
+      # RAM: mặc định cho VPS 8GB (~1/4 và 3/4 RAM). Máy nhỏ hơn đặt PG_SHARED_BUFFERS, PG_EFFECTIVE_CACHE_SIZE trong .env.
+      PG_SHARED_BUFFERS: ${PG_SHARED_BUFFERS:-}
+      PG_EFFECTIVE_CACHE_SIZE: ${PG_EFFECTIVE_CACHE_SIZE:-}
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./pg-start.sh:/pg-start.sh:ro
-      - ./pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U app -d products"]
       interval: 5s

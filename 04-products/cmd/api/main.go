@@ -86,10 +86,7 @@ func run() error {
 			return err
 		}
 	}
-	rdb, err := rediscache.Connect(ctx, cfg.RedisAddr, cfg.RedisPassword)
-	if err != nil {
-		return err
-	}
+	rdb := rediscache.Connect(ctx, cfg.RedisAddr, cfg.RedisPassword, log)
 	defer rdb.Close()
 	store, err := s3store.New(s3store.Config(cfg.Storage))
 	if err != nil {
@@ -100,6 +97,7 @@ func run() error {
 	// ----- Service (business logic) -----
 	assets := service.NewAssetService(postgres.NewAssetRepo(pool), store, tx, log)
 	productRepo := postgres.NewProductRepo(pool)
+	reviewRepo := postgres.NewReviewRepo(pool)
 	jobs := []worker.Job{ // OncePer: cả cụm chỉ 1 instance chạy mỗi chu kỳ
 		{Name: "asset-gc", Interval: 10 * time.Minute, Run: rediscache.OncePer(rdb, "asset-gc", 10*time.Minute, assets.CollectGarbage)},
 	}
@@ -111,6 +109,7 @@ func run() error {
 		defer replica.Close()
 		rr := postgres.NewReadRouter(pool, replica, log)
 		productRepo.ReadFrom(rr)
+		reviewRepo.ReadFrom(rr)
 		jobs = append(jobs, worker.Job{Name: "replica-check", Interval: 5 * time.Second, Run: rr.Check}) // mỗi instance tự kiểm tra
 	}
 	cache := rediscache.NewProductCache(rdb, cfg.CacheTTL)
@@ -118,7 +117,7 @@ func run() error {
 	orders := service.NewOrderService(postgres.NewOrderRepo(pool), cache, log)
 	products := service.NewProductService(productRepo, cache, assets, orders, log)
 	variants := service.NewVariantService(postgres.NewVariantRepo(pool), cache, log)
-	reviews := service.NewReviewService(postgres.NewReviewRepo(pool), cache, log)
+	reviews := service.NewReviewService(reviewRepo, cache, log)
 
 	// Search: Meilisearch nếu có cấu hình, lỗi/chậm thì SearchService tự dùng Postgres.
 	var engine service.SearchEngine
@@ -146,7 +145,7 @@ func run() error {
 			return sync.Run(ctx)
 		}})
 	}
-	search := service.NewSearchService(engine, productRepo, cache, cfg.SearchTimeout, log)
+	search := service.NewSearchService(engine, productRepo, cache, cfg.SearchTimeout, cfg.SearchPGLimit, log)
 	authSvc, err := service.NewAuthService(
 		postgres.NewUserRepo(pool), postgres.NewRefreshTokenRepo(pool),
 		rediscache.NewLoginLimiter(rdb, 10, 15*time.Minute), // 10 lần sai / 15 phút / email
